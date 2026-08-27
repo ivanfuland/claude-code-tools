@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/msg_hook.py\" post-tool-use",
+            "command": "msg-hook post-tool-use",
             "timeout": 5
           }
         ]
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/msg_hook.py\" stop",
+            "command": "msg-hook stop",
             "timeout": 5
           }
         ]
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/msg_hook.py\" prompt-submit",
+            "command": "msg-hook prompt-submit",
             "timeout": 5
           }
         ]
