@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from claude_code_tools.msg.models import (
     AgentKind,
+    ConsumerProtocol,
+    ContinuationState,
+    RegistrationIdentity,
 )
 from claude_code_tools.msg.store import MsgStore
 
@@ -43,7 +48,50 @@ def two_agents(store):
     return a, b
 
 
+def register_first_mate(
+    store,
+    name="control",
+    pane_id="%1",
+    kind=AgentKind.CLAUDE,
+    pid=101,
+    process_start_identity="linux:101:1",
+):
+    agent = store.register_agent(
+        name,
+        pane_id,
+        "test",
+        kind,
+        pid=pid,
+        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        process_start_identity=process_start_identity,
+    )
+    return agent, RegistrationIdentity.from_agent(agent)
+
+
 class TestAgentRegistration:
+
+    def test_register_rejects_name_over_utf8_limit(self, store):
+        with pytest.raises(ValueError, match="256 UTF-8 bytes"):
+            store.register_agent(
+                "界" * 86, "%1", "test", AgentKind.CLAUDE,
+            )
+
+        assert store.list_agents("test") == []
+
+    def test_register_persists_first_mate_consumer_and_process_identity(self, store):
+        agent = store.register_agent(
+            name="executor",
+            pane_id="%7",
+            tmux_session="test",
+            agent_kind=AgentKind.CODEX,
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            process_start_identity="linux:4242:100",
+        )
+
+        loaded = store.get_agent_by_id(agent.session_id)
+        assert loaded is not None
+        assert loaded.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
+        assert loaded.process_start_identity == "linux:4242:100"
 
     def test_register_new_agent(self, store):
         agent = store.register_agent(
@@ -341,12 +389,429 @@ class TestAgentRegistration:
 
         assert store.get_agent_by_id(moving.session_id).pane_id == "%2"
 
+    @pytest.mark.parametrize(
+        ("source_kind", "target_kind"),
+        (
+            (AgentKind.CLAUDE, AgentKind.CODEX),
+            (AgentKind.CODEX, AgentKind.CLAUDE),
+        ),
+    )
+    def test_retarget_refreshes_long_lived_tui_identity(
+        self, store, source_kind, target_kind,
+    ):
+        agent = store.register_agent(
+            "control", "%1", "test", source_kind,
+            pid=101, cwd="/old", process_start_identity="linux:101:10",
+        )
+
+        moved = store.retarget_agent(
+            agent.session_id,
+            "%9",
+            "test",
+            agent_kind=target_kind,
+            pid=202,
+            cwd="/new",
+            process_start_identity="linux:202:20",
+        )
+
+        assert (
+            moved.session_id,
+            moved.agent_kind,
+            moved.pid,
+            moved.cwd,
+            moved.process_start_identity,
+        ) == (
+            agent.session_id,
+            target_kind,
+            202,
+            "/new",
+            "linux:202:20",
+        )
+
+    def test_retarget_replace_candidate_is_atomic_and_preserves_history(self, store):
+        sender = store.register_agent("sender", "%1", "test", AgentKind.CLAUDE)
+        stable = store.register_agent(
+            "control", "%2", "test", AgentKind.CLAUDE,
+            pid=102, cwd="/old", process_start_identity="linux:102:10",
+        )
+        candidate = store.register_agent(
+            "candidate", "%9", "test", AgentKind.CODEX,
+            pid=909, cwd="/new", process_start_identity="linux:909:90",
+        )
+        thread = store.create_thread(
+            "control", sender.session_id, [sender.session_id, stable.session_id],
+        )
+        store.send_message(thread.id, sender.session_id, "keep unread")
+        before = store.get_inbox(stable.session_id)
+
+        moved = store.retarget_agent(
+            stable.session_id,
+            "%9",
+            "test",
+            agent_kind=AgentKind.CODEX,
+            pid=909,
+            cwd="/new",
+            process_start_identity="linux:909:90",
+            replace_candidate_session_id=candidate.session_id,
+        )
+
+        assert moved.session_id == stable.session_id
+        assert moved.pane_id == "%9"
+        assert moved.agent_kind is AgentKind.CODEX
+        assert candidate.session_id not in {
+            item.session_id for item in store.list_agents("test")
+        }
+        assert store.get_inbox(stable.session_id) == before
+        assert [item.id for item in store.list_threads(stable.session_id)] == [thread.id]
+        assert [item.session_id for item in store.list_agents("test")] == [
+            sender.session_id,
+            stable.session_id,
+        ]
+
+    def test_retarget_replace_candidate_retry_returns_committed_stable_identity(
+        self, store,
+    ):
+        stable = store.register_agent(
+            "control", "%2", "test", AgentKind.CLAUDE,
+            pid=102, cwd="/old", process_start_identity="linux:102:10",
+        )
+        candidate = store.register_agent(
+            "candidate", "%9", "test", AgentKind.CODEX,
+            pid=909, cwd="/new", process_start_identity="linux:909:90",
+        )
+        kwargs = {
+            "agent_kind": AgentKind.CODEX,
+            "pid": 909,
+            "cwd": "/new",
+            "process_start_identity": "linux:909:90",
+            "replace_candidate_session_id": candidate.session_id,
+        }
+        first = store.retarget_agent(stable.session_id, "%9", "test", **kwargs)
+
+        retried = store.retarget_agent(stable.session_id, "%9", "test", **kwargs)
+
+        assert retried == first
+        assert [item.session_id for item in store.list_agents("test")] == [
+            stable.session_id,
+        ]
+
+    @pytest.mark.parametrize(
+        "stage",
+        (
+            "before_candidate_deactivate",
+            "after_candidate_deactivate",
+            "after_stable_update",
+        ),
+    )
+    def test_retarget_replace_candidate_rolls_back_every_failpoint(self, store, stage):
+        stable = store.register_agent(
+            "control", "%2", "test", AgentKind.CLAUDE,
+            pid=102, cwd="/old", process_start_identity="linux:102:10",
+        )
+        candidate = store.register_agent(
+            "candidate", "%9", "test", AgentKind.CODEX,
+            pid=909, cwd="/new", process_start_identity="linux:909:90",
+        )
+
+        def failpoint(actual):
+            if actual == stage:
+                raise RuntimeError(stage)
+
+        with pytest.raises(RuntimeError, match=stage):
+            store.retarget_agent(
+                stable.session_id,
+                "%9",
+                "test",
+                agent_kind=AgentKind.CODEX,
+                pid=909,
+                cwd="/new",
+                process_start_identity="linux:909:90",
+                replace_candidate_session_id=candidate.session_id,
+                _failpoint=failpoint,
+            )
+
+        assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
+        assert candidate.session_id in {
+            item.session_id for item in store.list_agents("test")
+        }
+
+    def test_retarget_replace_candidate_requires_exact_target_identity(self, store):
+        stable = store.register_agent("control", "%2", "test", AgentKind.CLAUDE)
+        candidate = store.register_agent(
+            "candidate", "%9", "test", AgentKind.CODEX,
+            pid=909, cwd="/new", process_start_identity="linux:909:90",
+        )
+
+        with pytest.raises(ValueError, match="candidate identity mismatch"):
+            store.retarget_agent(
+                stable.session_id,
+                "%9",
+                "test",
+                agent_kind=AgentKind.CODEX,
+                pid=909,
+                cwd="/new",
+                process_start_identity="linux:909:reused",
+                replace_candidate_session_id=candidate.session_id,
+            )
+
+        assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
+        assert candidate.session_id in {
+            item.session_id for item in store.list_agents("test")
+        }
+
+    def test_retarget_replace_candidate_refuses_unread_candidate_inbox(self, store):
+        sender = store.register_agent("sender", "%1", "test", AgentKind.CLAUDE)
+        stable = store.register_agent("control", "%2", "test", AgentKind.CLAUDE)
+        candidate = store.register_agent(
+            "candidate", "%9", "test", AgentKind.CODEX,
+            pid=909, cwd="/new", process_start_identity="linux:909:90",
+        )
+        thread = store.create_thread(
+            "candidate work",
+            sender.session_id,
+            [sender.session_id, candidate.session_id],
+        )
+        store.send_message(thread.id, sender.session_id, "candidate must drain")
+
+        with pytest.raises(ValueError, match="candidate has 1 unread delivery"):
+            store.retarget_agent(
+                stable.session_id,
+                "%9",
+                "test",
+                agent_kind=AgentKind.CODEX,
+                pid=909,
+                cwd="/new",
+                process_start_identity="linux:909:90",
+                replace_candidate_session_id=candidate.session_id,
+            )
+
+        assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
+        assert candidate.session_id in {
+            item.session_id for item in store.list_agents("test")
+        }
+
     def test_touch_agent(self, store, two_agents):
         a, _ = two_agents
         old_seen = a.last_seen
         store.touch_agent(a.session_id)
         updated = store.get_agent_by_id(a.session_id)
         assert updated.last_seen >= old_seen
+
+
+class TestContinuationRecords:
+
+    @pytest.mark.parametrize("generation", ("", "x" * 129, "bad\nvalue"))
+    def test_set_rejects_invalid_generation(self, store, generation):
+        _agent, caller = register_first_mate(store)
+
+        with pytest.raises(ValueError, match="generation"):
+            store.set_continuation(caller, generation, ttl_secs=90)
+
+    @pytest.mark.parametrize("ttl_secs", (False, 0, 1.5, 121))
+    def test_set_rejects_invalid_ttl(self, store, ttl_secs):
+        _agent, caller = register_first_mate(store)
+
+        with pytest.raises(ValueError, match="ttl_secs"):
+            store.set_continuation(
+                caller, "assignment", ttl_secs=ttl_secs,
+            )
+
+    def test_set_rejects_naive_timestamp(self, store):
+        _agent, caller = register_first_mate(store)
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            store.set_continuation(
+                caller,
+                "assignment",
+                ttl_secs=90,
+                now=datetime(2026, 1, 1),
+            )
+
+    def test_legacy_registration_cannot_arm_continuation(self, store):
+        legacy = store.register_agent(
+            "legacy", "%1", "test", AgentKind.CLAUDE,
+        )
+
+        with pytest.raises(ValueError, match="first-mate.v1"):
+            store.set_continuation(
+                RegistrationIdentity.from_agent(legacy),
+                "assignment",
+                ttl_secs=90,
+            )
+
+    def test_retarget_preserves_armed_generation(self, store):
+        agent, caller = register_first_mate(
+            store, name="executor", kind=AgentKind.CODEX,
+        )
+        store.set_continuation(caller, "assignment", ttl_secs=90)
+
+        moved = store.retarget_agent(agent.session_id, "%9", "test")
+
+        assert moved.session_id == agent.session_id
+        assert store.get_continuation_status(agent.session_id).generation == (
+            "assignment"
+        )
+
+    def test_malformed_heartbeat_is_stale_not_idle(self, store):
+        agent, caller = register_first_mate(
+            store, name="executor", kind=AgentKind.CODEX,
+        )
+        store.set_continuation(caller, "assignment", ttl_secs=90)
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "UPDATE continuation_leases SET expires_at = 'not-a-time'"
+            )
+
+        status = store.get_continuation_status(agent.session_id)
+
+        assert status.state is ContinuationState.ACTIVE_STALE
+        assert status.generation == "assignment"
+
+    def test_expired_heartbeat_remains_armed_and_routes_to_recovery(self, store):
+        agent, caller = register_first_mate(store)
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        fresh = store.set_continuation(
+            caller, "assignment-1", ttl_secs=90, now=now,
+        )
+        stale = store.get_continuation_status(
+            agent.session_id, now=now + timedelta(seconds=91),
+        )
+
+        assert fresh.state is ContinuationState.ACTIVE_FRESH
+        assert stale.state is ContinuationState.ACTIVE_STALE
+        assert stale.generation == "assignment-1"
+
+    def test_touch_refreshes_existing_generation_but_never_creates_one(self, store):
+        _agent, caller = register_first_mate(
+            store, name="executor", pane_id="%2", kind=AgentKind.CODEX,
+        )
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        idle = store.touch_continuation(
+            caller, "assignment-2", ttl_secs=90, now=now,
+        )
+        store.set_continuation(
+            caller, "assignment-2", ttl_secs=90, now=now,
+        )
+        touched = store.touch_continuation(
+            caller,
+            "assignment-2",
+            ttl_secs=90,
+            now=now + timedelta(seconds=120),
+        )
+
+        assert idle.state is ContinuationState.IDLE
+        assert touched.state is ContinuationState.ACTIVE_FRESH
+        assert touched.generation == "assignment-2"
+
+    def test_clear_requires_exact_generation_and_retirement_clears_record(self, store):
+        agent, caller = register_first_mate(
+            store, name="builder", pane_id="%3", kind=AgentKind.CODEX,
+        )
+        store.set_continuation(caller, "current", ttl_secs=90)
+
+        assert not store.clear_continuation(caller, "stale")
+        assert store.get_continuation_status(agent.session_id).state is (
+            ContinuationState.ACTIVE_FRESH
+        )
+        assert store.clear_continuation(caller, "current")
+        assert store.get_continuation_status(agent.session_id).state is (
+            ContinuationState.IDLE
+        )
+
+        store.set_continuation(caller, "next", ttl_secs=90)
+        assert store.retire_agent(agent.session_id)
+        assert store.get_continuation_status(agent.session_id).state is (
+            ContinuationState.IDLE
+        )
+
+    def test_future_over_limit_heartbeat_is_stale(self, store):
+        agent, caller = register_first_mate(store)
+        store.set_continuation(caller, "assignment", ttl_secs=90)
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "UPDATE continuation_leases SET expires_at = ?",
+                ("2099-01-01T00:00:00+00:00",),
+            )
+
+        status = store.get_continuation_status(agent.session_id)
+
+        assert status.state is ContinuationState.ACTIVE_STALE
+
+    def test_retargeted_old_identity_cannot_touch_or_clear(self, store):
+        agent, old_caller = register_first_mate(store)
+        store.set_continuation(old_caller, "assignment", ttl_secs=90)
+        store.retarget_agent(agent.session_id, "%9", "test")
+        current_caller = replace(old_caller, pane_id="%9")
+
+        with pytest.raises(ValueError, match="identity mismatch"):
+            store.touch_continuation(
+                old_caller, "assignment", ttl_secs=90,
+            )
+        with pytest.raises(ValueError, match="identity mismatch"):
+            store.clear_continuation(old_caller, "assignment")
+        assert store.touch_continuation(
+            current_caller, "assignment", ttl_secs=90,
+        ).state is ContinuationState.ACTIVE_FRESH
+
+    def test_pid_reuse_start_identity_cannot_touch(self, store):
+        agent, old_caller = register_first_mate(store)
+        store.set_continuation(old_caller, "assignment", ttl_secs=90)
+        store.register_agent(
+            agent.name,
+            agent.pane_id,
+            agent.tmux_session,
+            agent.agent_kind,
+            pid=agent.pid,
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            process_start_identity="linux:101:2",
+        )
+
+        with pytest.raises(ValueError, match="identity mismatch"):
+            store.touch_continuation(
+                old_caller, "assignment", ttl_secs=90,
+            )
+
+    def test_old_wait_cannot_touch_replacement_generation(self, store):
+        _agent, caller = register_first_mate(store)
+        store.set_continuation(caller, "old", ttl_secs=90)
+        store.set_continuation(caller, "new", ttl_secs=90)
+
+        with pytest.raises(ValueError, match="generation mismatch"):
+            store.touch_continuation(caller, "old", ttl_secs=90)
+        assert store.touch_continuation(
+            caller, "new", ttl_secs=90,
+        ).generation == "new"
+
+    def test_armed_registration_cannot_downgrade_to_legacy(self, store):
+        agent, caller = register_first_mate(store)
+        store.set_continuation(caller, "assignment", ttl_secs=90)
+
+        with pytest.raises(ValueError, match="clear continuation"):
+            store.register_agent(
+                agent.name,
+                agent.pane_id,
+                agent.tmux_session,
+                agent.agent_kind,
+            )
+
+        assert store.get_agent_by_id(agent.session_id).consumer_protocol is (
+            ConsumerProtocol.FIRST_MATE_V1
+        )
+
+        assert store.clear_continuation(caller, "assignment")
+        downgraded = store.register_agent(
+            agent.name,
+            agent.pane_id,
+            agent.tmux_session,
+            agent.agent_kind,
+        )
+        assert downgraded.session_id == agent.session_id
+        assert downgraded.consumer_protocol is ConsumerProtocol.LEGACY
+        assert store.get_continuation_status(agent.session_id).state is (
+            ContinuationState.IDLE
+        )
 
 
 class TestThreads:
@@ -527,6 +992,265 @@ class TestMessages:
         # Inbox should be empty now
         inbox = store.get_inbox(b.session_id)
         assert len(inbox) == 0
+
+    def test_send_rejects_body_over_utf8_limit_before_insert(self, store, two_agents):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "bounded", sender.session_id, [sender.session_id, recipient.session_id],
+        )
+
+        with pytest.raises(ValueError, match="65536 UTF-8 bytes"):
+            store.send_message(thread.id, sender.session_id, "x" * 65537)
+
+        with sqlite3.connect(store.db_path) as connection:
+            assert connection.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+
+    def test_send_accepts_exact_mixed_width_utf8_boundary(self, store, two_agents):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "bounded", sender.session_id, [sender.session_id, recipient.session_id],
+        )
+        legal = "界" * 21845 + "x"
+        assert len(legal.encode("utf-8")) == 65536
+
+        message = store.send_message(thread.id, sender.session_id, legal)
+        with pytest.raises(ValueError, match="65536 UTF-8 bytes"):
+            store.send_message(thread.id, sender.session_id, legal + "x")
+
+        assert message.body == legal
+        with sqlite3.connect(store.db_path) as connection:
+            assert connection.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+
+    def test_peek_is_stable_bounded_and_does_not_mark_read(self, store, two_agents):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "peek", sender.session_id, [sender.session_id, recipient.session_id],
+        )
+        first = store.send_message(thread.id, sender.session_id, "first")
+        second = store.send_message(thread.id, sender.session_id, "second")
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "UPDATE messages SET created_at = ? WHERE id IN (?, ?)",
+                ("2026-01-01T00:00:00+00:00", first.id, second.id),
+            )
+            connection.execute(
+                "UPDATE agents SET name = 'renamed' WHERE session_id = ?",
+                (sender.session_id,),
+            )
+
+        page = store.peek_inbox(recipient.session_id, limit=1)
+
+        assert len(page) == 1
+        assert page[0]["message_id"] == min(first.id, second.id)
+        assert page[0]["sender_session_id"] == sender.session_id
+        assert page[0]["sender_name"] == sender.name
+        assert page[0]["body"] in {"first", "second"}
+        assert page[0]["body_too_large"] is False
+        assert len(store.get_inbox(recipient.session_id)) == 2
+
+    def test_peek_default_limit_is_fifty(self, store, two_agents):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "default", sender.session_id, [sender.session_id, recipient.session_id],
+        )
+        for index in range(60):
+            store.send_message(thread.id, sender.session_id, f"message-{index}")
+
+        assert len(store.peek_inbox(recipient.session_id)) == 50
+
+    def test_peek_returns_bounded_metadata_for_legacy_oversize_row(
+        self, store, two_agents,
+    ):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "poison", sender.session_id, [sender.session_id, recipient.session_id],
+        )
+        message = store.send_message(thread.id, sender.session_id, "small")
+        oversized = "z" * 70000
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "UPDATE messages SET body = ? WHERE id = ?",
+                (oversized, message.id),
+            )
+
+        row = store.peek_inbox(recipient.session_id, limit=1)[0]
+
+        assert row["body"] is None
+        assert row["body_too_large"] is True
+        assert row["body_bytes"] == 70000
+        assert row["body_sha256"] == __import__("hashlib").sha256(
+            oversized.encode()
+        ).hexdigest()
+
+    def test_peek_streams_legacy_oversize_body_in_bounded_chunks(
+        self, store, two_agents, monkeypatch,
+    ):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "poison", sender.session_id, [sender.session_id, recipient.session_id],
+        )
+        message = store.send_message(thread.id, sender.session_id, "small")
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "UPDATE messages SET body = ? WHERE id = ?",
+                ("z" * (2 * 1024 * 1024), message.id),
+            )
+        real_connection = store._get_conn()
+        read_sizes = []
+
+        class BlobProxy:
+            def __init__(self, blob):
+                self.blob = blob
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.blob.close()
+
+            def read(self, size=-1):
+                assert 0 < size <= 65536
+                read_sizes.append(size)
+                return self.blob.read(size)
+
+        class ConnectionProxy:
+            def execute(self, sql, parameters=()):
+                assert "SELECT CAST(body AS BLOB)" not in sql
+                return real_connection.execute(sql, parameters)
+
+            def blobopen(self, *args, **kwargs):
+                return BlobProxy(real_connection.blobopen(*args, **kwargs))
+
+            def close(self):
+                real_connection.close()
+
+        monkeypatch.setattr(store, "_get_conn", lambda: ConnectionProxy())
+
+        row = store.peek_inbox(recipient.session_id, limit=1)[0]
+
+        assert row["body_too_large"] is True
+        assert len(read_sizes) > 1
+
+    def test_peek_bounds_legacy_sender_name_and_omits_thread_title(
+        self, store, two_agents,
+    ):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "t" * (2 * 1024 * 1024),
+            sender.session_id,
+            [sender.session_id, recipient.session_id],
+        )
+        message = store.send_message(thread.id, sender.session_id, "body")
+        legacy_name = "n" * 70000
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "UPDATE messages SET sender_name = ? WHERE id = ?",
+                (legacy_name, message.id),
+            )
+
+        row = store.peek_inbox(recipient.session_id, limit=1)[0]
+
+        assert "thread_title" not in row
+        assert row["sender_name"] is None
+        assert row["sender_name_too_large"] is True
+        assert row["sender_name_bytes"] == 70000
+        assert row["sender_name_sha256"] == __import__("hashlib").sha256(
+            legacy_name.encode()
+        ).hexdigest()
+
+    def test_ack_is_scoped_and_idempotent_without_rewriting_read_at(
+        self, store, two_agents,
+    ):
+        sender, recipient = two_agents
+        other = store.register_agent("other", "%3", "test", AgentKind.CLAUDE)
+        thread = store.create_thread(
+            "scope", sender.session_id,
+            [sender.session_id, recipient.session_id, other.session_id],
+        )
+        store.send_message(thread.id, sender.session_id, "body")
+        recipient_delivery = store.get_inbox(recipient.session_id)[0]["delivery_id"]
+        other_delivery = store.get_inbox(other.session_id)[0]["delivery_id"]
+
+        assert store.ack_deliveries(
+            recipient.session_id, [recipient_delivery],
+        ) == [recipient_delivery]
+        with sqlite3.connect(store.db_path) as connection:
+            first_read_at = connection.execute(
+                "SELECT read_at FROM deliveries WHERE id = ?",
+                (recipient_delivery,),
+            ).fetchone()[0]
+        assert store.ack_deliveries(
+            recipient.session_id, [recipient_delivery],
+        ) == [recipient_delivery]
+        with sqlite3.connect(store.db_path) as connection:
+            second_read_at = connection.execute(
+                "SELECT read_at FROM deliveries WHERE id = ?",
+                (recipient_delivery,),
+            ).fetchone()[0]
+        assert second_read_at == first_read_at
+
+        with pytest.raises(ValueError, match="not owned by current recipient"):
+            store.ack_deliveries(recipient.session_id, [other_delivery])
+        assert store.get_inbox(other.session_id)[0]["delivery_id"] == other_delivery
+
+    def test_ack_batch_rolls_back_when_one_delivery_has_wrong_owner(
+        self, store, two_agents,
+    ):
+        sender, recipient = two_agents
+        other = store.register_agent("other", "%3", "test", AgentKind.CLAUDE)
+        thread = store.create_thread(
+            "scope", sender.session_id,
+            [sender.session_id, recipient.session_id, other.session_id],
+        )
+        store.send_message(thread.id, sender.session_id, "body")
+        own = store.get_inbox(recipient.session_id)[0]["delivery_id"]
+        foreign = store.get_inbox(other.session_id)[0]["delivery_id"]
+
+        with pytest.raises(ValueError, match="not owned by current recipient"):
+            store.ack_deliveries(recipient.session_id, [own, foreign])
+
+        assert store.get_inbox(recipient.session_id)[0]["delivery_id"] == own
+
+    def test_ack_claimed_delivery_clears_claim_fields(self, store, two_agents):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "claim", sender.session_id, [sender.session_id, recipient.session_id],
+        )
+        store.send_message(thread.id, sender.session_id, "body")
+        delivery = store.claim_pending_deliveries("watcher", recipient_id=recipient.session_id)[0]
+
+        store.ack_deliveries(recipient.session_id, [delivery["id"]])
+
+        with sqlite3.connect(store.db_path) as connection:
+            state, read_at, claimed_by, expires_at = connection.execute(
+                """SELECT state, read_at, claimed_by, claim_expires_at
+                FROM deliveries WHERE id = ?""",
+                (delivery["id"],),
+            ).fetchone()
+        assert state == "read"
+        assert read_at is not None
+        assert claimed_by is None
+        assert expires_at is None
+
+    def test_ack_missing_or_retired_delivery_rolls_back_batch(self, store, two_agents):
+        sender, recipient = two_agents
+        thread = store.create_thread(
+            "missing", sender.session_id, [sender.session_id, recipient.session_id],
+        )
+        store.send_message(thread.id, sender.session_id, "body")
+        delivery_id = store.get_inbox(recipient.session_id)[0]["delivery_id"]
+
+        with pytest.raises(ValueError, match="not found"):
+            store.ack_deliveries(recipient.session_id, [delivery_id, "missing"])
+        assert store.get_inbox(recipient.session_id)
+
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "UPDATE deliveries SET state = 'retired' WHERE id = ?",
+                (delivery_id,),
+            )
+        with pytest.raises(ValueError, match="retired"):
+            store.ack_deliveries(recipient.session_id, [delivery_id])
 
     def test_inbox_shows_unnotified_messages(
         self, store, two_agents,
@@ -866,10 +1590,21 @@ class TestWatcherHeartbeat:
         assert not store.is_watcher_alive()
 
     def test_get_watcher_info(self, store):
-        store.update_heartbeat("watcher-1", pid=1234)
+        store.update_heartbeat(
+            "watcher-1",
+            pid=1234,
+            process_start_identity="linux:1234:55",
+            distribution_version="1.26.0",
+            module_sha256="a" * 64,
+            db_schema_version=4,
+        )
         info = store.get_watcher_info()
         assert len(info) == 1
         assert info[0].pid == 1234
+        assert info[0].process_start_identity == "linux:1234:55"
+        assert info[0].distribution_version == "1.26.0"
+        assert info[0].module_sha256 == "a" * 64
+        assert info[0].db_schema_version == 4
 
 
 class TestThreeAgentThread:

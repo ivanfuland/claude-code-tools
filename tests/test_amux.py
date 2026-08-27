@@ -346,6 +346,84 @@ class TestScanWithStubbedTmux:
         monkeypatch.setattr(scan_mod, "_tmux", lambda *a: "")
         assert scan_mod.scan() == []
 
+    def test_resolve_pane_agent_returns_exact_long_lived_tui(self, monkeypatch) -> None:
+        from claude_code_tools.amux import scan as scan_mod
+
+        calls = []
+
+        def tmux_target(socket_path, *args):
+            calls.append((socket_path, args))
+            return self.SEP.join(("%7", "main", "700", "/repo/new", "main:3.7"))
+
+        monkeypatch.setattr(scan_mod, "_tmux_target", tmux_target)
+        monkeypatch.setattr(
+            scan_mod,
+            "_children_by_ppid",
+            lambda: {
+                700: [(701, "direnv exec . bash")],
+                701: [(777, "node /opt/@openai/codex/bin/codex.js")],
+            },
+        )
+
+        agent = scan_mod.resolve_pane_agent("%7", "/tmp/tmux-main")
+
+        assert agent is not None
+        assert (agent.pane, agent.session, agent.kind, agent.pid, agent.cwd) == (
+            "main:3.7", "main", "codex", 777, "/repo/new",
+        )
+        assert agent.extra == {"pane_id": "%7"}
+        assert calls[0][0] == "/tmp/tmux-main"
+
+    def test_resolve_pane_agent_fails_closed_without_one_harness(self, monkeypatch) -> None:
+        from claude_code_tools.amux import scan as scan_mod
+
+        monkeypatch.setattr(
+            scan_mod,
+            "_tmux_target",
+            lambda *_args: self.SEP.join(("%7", "main", "700", "/repo", "main:3.7")),
+        )
+        monkeypatch.setattr(
+            scan_mod,
+            "_children_by_ppid",
+            lambda: {700: [(701, "vim file.py")]},
+        )
+
+        assert scan_mod.resolve_pane_agent("%7", "/tmp/tmux-main") is None
+
+    def test_resolve_pane_agent_accepts_harness_as_pane_root(self, monkeypatch) -> None:
+        from claude_code_tools.amux import scan as scan_mod
+
+        monkeypatch.setattr(
+            scan_mod,
+            "_tmux_target",
+            lambda *_args: self.SEP.join(
+                ("%7", "main", "700", "/repo", "main:3.7")
+            ),
+        )
+        monkeypatch.setattr(scan_mod, "_children_by_ppid", lambda: {})
+        monkeypatch.setattr(
+            scan_mod, "_command_for_pid", lambda pid: "claude" if pid == 700 else "",
+        )
+
+        agent = scan_mod.resolve_pane_agent("%7", "/tmp/tmux-main")
+
+        assert agent is not None
+        assert (agent.kind, agent.pid, agent.cwd) == ("claude", 700, "/repo")
+
+    def test_scan_accepts_harness_as_pane_root(self, monkeypatch) -> None:
+        from claude_code_tools.amux import scan as scan_mod
+
+        rows = [("s:1.1", "s", "700", "claude", "/repo")]
+        monkeypatch.setattr(scan_mod, "_tmux", lambda *args: (
+            self._listing(rows) if args[0] == "list-panes" else "screen"
+        ))
+        monkeypatch.setattr(scan_mod, "_children_by_ppid", lambda: {})
+        monkeypatch.setattr(scan_mod, "_command_for_pid", lambda pid: "claude")
+
+        agents = scan_mod.scan(workers=1)
+
+        assert [(agent.kind, agent.pid) for agent in agents] == [("claude", 700)]
+
 
 class TestGitContext:
     def test_plain_repo(self, tmp_path) -> None:
