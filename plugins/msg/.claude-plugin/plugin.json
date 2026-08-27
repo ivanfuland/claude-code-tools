@@ -1,6 +1,6 @@
 {
   "name": "msg",
-  "version": "1.15.0",
+  "version": "1.15.1",
   "description": "Inter-agent communication with native First-mate lifecycle hooks for Claude Code and Codex CLI",
   "author": {
     "name": "Prasad Chalasani"

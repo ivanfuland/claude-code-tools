@@ -50,19 +50,19 @@ def test_paired_manifests_share_version_and_codex_hook_path():
     claude = load_json(PLUGIN / ".claude-plugin/plugin.json")
     codex = load_json(PLUGIN / ".codex-plugin/plugin.json")
 
-    assert claude["version"] == codex["version"] == "1.15.0"
+    assert claude["version"] == codex["version"] == "1.15.1"
     assert codex["hooks"] == "./hooks/hooks.json"
     assert "Native lifecycle hooks" in codex["interface"]["capabilities"]
 
 
-def test_plugin_hook_file_uses_installed_root_for_all_native_events():
+def test_plugin_hook_file_uses_installed_entrypoint_for_all_native_events():
     hooks = load_json(PLUGIN / "hooks/hooks.json")["hooks"]
 
     assert set(hooks) == {"PostToolUse", "Stop", "UserPromptSubmit"}
     for event, groups in hooks.items():
         assert len(groups) == 1
         command = groups[0]["hooks"][0]["command"]
-        assert "${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/msg_hook.py" in command
+        assert command.startswith("msg-hook ")
         assert {
             "PostToolUse": "post-tool-use",
             "Stop": "stop",
@@ -107,7 +107,7 @@ def test_release_evidence_binds_cli_contract_plugin_version_and_tree_hash():
     assert evidence["cli_contract_schema"] == "msg.cli.v1"
     assert evidence["cli_release_base"] == "1.25.6"
     assert evidence["cli_release_status"] == "unreleased"
-    assert evidence["plugin_version"] == "1.15.0"
+    assert evidence["plugin_version"] == "1.15.1"
     assert evidence["plugin_payload_sha256"] == plugin_payload_sha256()
     assert evidence["claude_manifest_sha256"] == hashlib.sha256(
         claude.read_bytes()
@@ -117,7 +117,7 @@ def test_release_evidence_binds_cli_contract_plugin_version_and_tree_hash():
     ).hexdigest()
 
 
-def test_installed_root_hook_commands_drive_real_pane_state(tmp_path):
+def test_codex_hook_commands_need_no_root_env_or_plugin_cwd(tmp_path):
     hooks = load_json(PLUGIN / "hooks/hooks.json")["hooks"]
     commands = {
         event: groups[0]["hooks"][0]["command"]
@@ -150,11 +150,12 @@ def test_installed_root_hook_commands_drive_real_pane_state(tmp_path):
             now=datetime.now(timezone.utc) - timedelta(minutes=5),
         )
         env = os.environ.copy()
+        env.pop("PLUGIN_ROOT", None)
+        env.pop("CLAUDE_PLUGIN_ROOT", None)
         env.update(
             {
                 "PATH": f"{Path(sys.executable).parent}:{env.get('PATH', '')}",
                 "PYTHONPATH": str(ROOT),
-                "PLUGIN_ROOT": str(PLUGIN),
                 "MSG_DB_DIR": str(db_dir),
                 "TMUX": f"{socket_path},0,0",
                 "TMUX_PANE": pane,
@@ -164,7 +165,7 @@ def test_installed_root_hook_commands_drive_real_pane_state(tmp_path):
         post = subprocess.run(
             ["bash", "-c", commands["PostToolUse"]],
             input="{}",
-            cwd=ROOT,
+            cwd=tmp_path,
             env=env,
             capture_output=True,
             text=True,
@@ -178,7 +179,7 @@ def test_installed_root_hook_commands_drive_real_pane_state(tmp_path):
         stop = subprocess.run(
             ["bash", "-c", commands["Stop"]],
             input=json.dumps({"model": "gpt-test", "stop_hook_active": False}),
-            cwd=ROOT,
+            cwd=tmp_path,
             env=env,
             capture_output=True,
             text=True,
@@ -189,7 +190,7 @@ def test_installed_root_hook_commands_drive_real_pane_state(tmp_path):
         prompt = subprocess.run(
             ["bash", "-c", commands["UserPromptSubmit"]],
             input=json.dumps({"prompt": "opaque-user-prompt"}),
-            cwd=ROOT,
+            cwd=tmp_path,
             env=env,
             capture_output=True,
             text=True,

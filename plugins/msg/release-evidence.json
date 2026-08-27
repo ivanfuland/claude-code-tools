@@ -7,10 +7,10 @@
   "cli_wheel_sha256": "937a3adcee6b0156b7d69ebc6abbe8287f5b60219e74510d6c2814fe6a293e67",
   "cli_contract_schema": "msg.cli.v1",
   "db_schema_version": 4,
-  "plugin_version": "1.15.0",
-  "plugin_payload_sha256": "f60a2c2f312a8f2d68b6efed0996aa0c8632b5f06583020caabf86befdb7e1ac",
-  "hooks_manifest_sha256": "66c58c51f8cb031ec77bcd5dd1df987091913de50b467e398302e4782acda311",
+  "plugin_version": "1.15.1",
+  "plugin_payload_sha256": "caf6522c84d1fcc5b1dcdf3d94f7f866b8f2efd86673154a701abf881f139b20",
+  "hooks_manifest_sha256": "1e2745075b516fd08995b24ab4f1403383a69f0a93025181d12c303446ce0087",
   "hook_adapter_sha256": "28d0eec330efcd10ebd6418b2cf8e2d6c20dbe95bae7119199fd00b5f5651bf4",
-  "claude_manifest_sha256": "8a3374a4c2a6238ff7f623cc339a4ecdbd697f623d68eeb1dd83ebd910d852a5",
-  "codex_manifest_sha256": "99d48fc2b2dd89a26269fd79ffcefc899c5ab87ea23f42ef2a955559c2566155"
+  "claude_manifest_sha256": "907cea690801ed26841411dbc2163be4a68ffb7aa69f826de5b7506a3d3cfdc1",
+  "codex_manifest_sha256": "449d091eba8c1358d65dd434e387be891156758cfe537740fb9b6ac7f9b727b8"
 }
