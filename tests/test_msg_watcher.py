@@ -80,26 +80,30 @@ def test_first_mate_delivery_stays_pending_and_never_touches_tmux(
     assert inbox[0]["state"] == "pending"
 
 
-def test_watcher_claims_legacy_but_not_first_mate_recipient(tmp_path):
+def test_watcher_routes_only_by_delivery_mode(tmp_path):
     watcher = Watcher(str(tmp_path / "msg.db"))
     sender = watcher.store.register_agent("sender", "%1", "test", AgentKind.CLAUDE)
-    legacy = watcher.store.register_agent("legacy", "%2", "test", AgentKind.CODEX)
-    first_mate = watcher.store.register_agent(
-        "first-mate", "%3", "test", AgentKind.CODEX,
+    push = watcher.store.register_agent(
+        "push", "%2", "test", AgentKind.CODEX,
         consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PUSH,
+    )
+    pull = watcher.store.register_agent(
+        "pull", "%3", "test", AgentKind.CODEX,
+        consumer_protocol="legacy",
         delivery_mode=DeliveryMode.PULL,
     )
     thread = watcher.store.create_thread(
         "mixed", sender.session_id,
-        [sender.session_id, legacy.session_id, first_mate.session_id],
+        [sender.session_id, push.session_id, pull.session_id],
     )
     watcher.store.send_message(thread.id, sender.session_id, "mixed")
 
     claimed = watcher.store.claim_pending_deliveries(watcher.watcher_id)
 
-    assert [row["recipient_id"] for row in claimed] == [legacy.session_id]
-    assert claimed[0]["recipient_consumer_protocol"] == "legacy"
-    assert watcher.store.get_inbox(first_mate.session_id)[0]["state"] == "pending"
+    assert [row["recipient_id"] for row in claimed] == [push.session_id]
+    assert claimed[0]["recipient_consumer_protocol"] == "first-mate.v1"
+    assert watcher.store.get_inbox(pull.session_id)[0]["state"] == "pending"
 
 
 def test_unknown_delivery_mode_fails_closed_and_records_error(caplog, tmp_path):

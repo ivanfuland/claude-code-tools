@@ -385,6 +385,37 @@ def test_first_mate_stop_pending_uses_native_continuation_without_consuming(
     assert store.get_inbox(receiver.session_id)[0]["state"] == "pending"
 
 
+def test_pull_stop_echoes_opaque_protocol_without_interpreting_it(store):
+    receiver = store.register_agent(
+        "opaque-pull",
+        "%2",
+        "test",
+        AgentKind.CODEX,
+        pid=202,
+        cwd="/repo",
+        consumer_protocol="probe.other.v1",
+        delivery_mode=DeliveryMode.PULL,
+        process_start_identity="linux:202:2",
+    )
+    store.set_continuation(
+        RegistrationIdentity.from_agent(receiver),
+        "opaque-generation",
+        ttl_secs=90,
+    )
+
+    with patch(
+        "claude_code_tools.msg.hooks.MsgStore", return_value=store,
+    ), patch(
+        "claude_code_tools.msg.hooks._find_self_agent", return_value=receiver,
+    ):
+        result = CliRunner().invoke(cli, ["stop"], input="{}")
+
+    assert json.loads(result.output)["reason"] == (
+        "[MSG pull protocol=probe.other.v1] "
+        "pending=0; lease=active_fresh."
+    )
+
+
 def test_first_mate_stop_routes_fresh_to_wait_and_stale_to_recovery(store):
     receiver = register_first_mate(store)
     identity = RegistrationIdentity.from_agent(receiver)
