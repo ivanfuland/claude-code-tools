@@ -320,6 +320,46 @@ print(json.dumps({
     )
 
 
+def test_codex_title_adapter_drains_buffered_notification_before_response(
+    monkeypatch, tmp_path,
+):
+    """A notification sharing one write with a response must not hide it."""
+    server = tmp_path / "fake_app_server_with_notification.py"
+    server.write_text(
+        """\
+import json
+import os
+import sys
+
+initialize = json.loads(sys.stdin.readline())
+payload = (
+    json.dumps({"method": "thread/started", "params": {}}) + "\\n"
+    + json.dumps({"id": initialize["id"], "result": {}}) + "\\n"
+).encode("utf-8")
+os.write(sys.stdout.fileno(), payload)
+sys.stdin.readline()
+rename = json.loads(sys.stdin.readline())
+print(json.dumps({"id": rename["id"], "result": {}}), flush=True)
+readback = json.loads(sys.stdin.readline())
+print(json.dumps({
+    "id": readback["id"],
+    "result": {"thread": {"name": rename["params"]["name"]}},
+}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hooks_module,
+        "_CODEX_APP_SERVER_COMMAND",
+        (sys.executable, str(server)),
+        raising=False,
+    )
+
+    assert hooks_module._set_codex_session_title(
+        "019d-thread", "example-exec-docs_01",
+    )
+
+
 def test_codex_bootstrap_stop_sets_native_session_title(monkeypatch, tmp_path):
     db_path = tmp_path / "msg.db"
     store = MsgStore(db_path)

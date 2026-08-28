@@ -10,13 +10,20 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 _ISOLATION_ROOT = tempfile.mkdtemp(prefix="cc-msg-tests-")
 os.chmod(_ISOLATION_ROOT, 0o700)
 os.environ["MSG_TEST_ISOLATION_ROOT"] = _ISOLATION_ROOT
-os.environ["HOME"] = _ISOLATION_ROOT
-os.environ.pop("TMUX", None)
-os.environ.pop("TMUX_PANE", None)
+os.environ["MSG_DB_DIR"] = str(Path(_ISOLATION_ROOT) / ".msg")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_msg_test_tmux(request, monkeypatch):
+    if request.node.path.name.startswith("test_msg_"):
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.delenv("TMUX_PANE", raising=False)
 
 
 def _cleanup_msg_test_home() -> None:

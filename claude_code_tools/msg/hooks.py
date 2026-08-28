@@ -150,9 +150,7 @@ def _set_codex_session_title(host_session_id: str, title: str) -> bool:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
+            bufsize=0,
         )
         if process.stdin is None or process.stdout is None or process.stderr is None:
             return False
@@ -160,29 +158,54 @@ def _set_codex_session_title(host_session_id: str, title: str) -> bool:
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
         deadline = time.monotonic() + 4.0
+        stdout_buffer = bytearray()
 
         def write_message(value: dict) -> None:
-            process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
-            process.stdin.flush()
+            payload = (
+                json.dumps(value, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            view = memoryview(payload)
+            while view:
+                written = os.write(process.stdin.fileno(), view)
+                if written <= 0:
+                    raise OSError("Codex app-server write made no progress")
+                view = view[written:]
+
+        def buffered_response(request_id: int) -> dict | None:
+            while True:
+                newline = stdout_buffer.find(b"\n")
+                if newline < 0:
+                    return None
+                raw = bytes(stdout_buffer[:newline])
+                del stdout_buffer[:newline + 1]
+                try:
+                    response = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(response, dict)
+                    and response.get("id") == request_id
+                ):
+                    return response
 
         def read_response(request_id: int) -> dict | None:
             while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    return None
+                response = buffered_response(request_id)
+                if response is not None:
+                    return response
                 remaining = max(0.0, deadline - time.monotonic())
-                for key, _mask in selector.select(timeout=remaining):
-                    line = key.fileobj.readline()
-                    if not line or key.data != "stdout":
+                events = selector.select(timeout=remaining)
+                if not events:
+                    if process.poll() is not None:
+                        return None
+                    continue
+                for key, _mask in events:
+                    chunk = os.read(key.fileobj.fileno(), 65_536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
                         continue
-                    try:
-                        response = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if (
-                        isinstance(response, dict)
-                        and response.get("id") == request_id
-                    ):
-                        return response
+                    if key.data == "stdout":
+                        stdout_buffer.extend(chunk)
             return None
 
         write_message({
