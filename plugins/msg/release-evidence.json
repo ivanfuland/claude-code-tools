@@ -3,14 +3,14 @@
   "cli_distribution": "claude-code-tools",
   "cli_release_base": "1.25.7",
   "cli_release_status": "unreleased",
-  "cli_source_commit": "fb1d5a82f2e49d66860213150c20653b138a5516",
-  "cli_wheel_sha256": "0d891147496a1d2b8e561fd3a9f18b34a022f4fe9ae9bd9fb326d24cca429696",
+  "cli_source_commit": "823d8b06d18b4d348747adfe10fe58c09fe38583",
+  "cli_wheel_sha256": "3bf7bd7b21536af85d7936a80c9398324ee64c44130dae59a3a22687ae029626",
   "cli_contract_schema": "msg.cli.v1",
   "db_schema_version": 5,
   "plugin_version": "1.15.2",
-  "plugin_payload_sha256": "f6a76613dd503f475e770daa8c69d09fb7fd7dc2b9f59bbcd851f53fc792002d",
-  "hooks_manifest_sha256": "be4d878e8886f1307715303e23b6d56347534b712f5b53b307e4ccc087fc8f70",
+  "plugin_payload_sha256": "4e2d94199a77dbb3afd170243a7345d4a91a46c26e4fa60d6672ea9816914c73",
+  "hooks_manifest_sha256": "d5fae08eb2db8bcf9fc479c191b2dd1d159ecb028e0adc33af6976bd47f9b363",
   "hook_adapter_sha256": "28d0eec330efcd10ebd6418b2cf8e2d6c20dbe95bae7119199fd00b5f5651bf4",
-  "claude_manifest_sha256": "d7945b1dba445156f73a776c8d0a80effa090e4436949bc2f7f28c8c64c68430",
-  "codex_manifest_sha256": "eba780dc28beedba7356fbef8842975134f3a8dfff8eb3ffb0df5f8ccc5854b6"
+  "claude_manifest_sha256": "452e68351d0074ff7f987f7d051abca7d2d7982dab4b8f0d33875f7f54b019f1",
+  "codex_manifest_sha256": "ec7736e4177ad8f2ecfa05565d8f75e57b934a2b31f24b50dd30e66a6720dcd7"
 }
