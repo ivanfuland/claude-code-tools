@@ -1,6 +1,18 @@
 {
   "description": "Native lifecycle hooks for legacy msg and first-mate.v1 consumers.",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "msg-hook session-start",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "*",

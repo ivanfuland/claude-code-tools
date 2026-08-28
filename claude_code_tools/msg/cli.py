@@ -20,9 +20,12 @@ from claude_code_tools.process_identity import process_start_identity
 from . import maintenance as maintenance_mode
 from .activation import (
     activation_generation,
+    is_first_mate_session_title,
+    load_host_session_attestation,
     remove_activation,
     write_activation,
 )
+from .hooks import hook_module_sha256
 from .json_contract import (
     SCHEMA,
     agent_payload,
@@ -44,6 +47,23 @@ from .store import (
 from .watcher import distribution_version, watcher_module_sha256
 
 MAX_MACHINE_OUTPUT_BYTES = 1024 * 1024
+
+
+def _window_name_for_pane(
+    tmux_socket: str | None, pane_id: str,
+) -> str | None:
+    cmd = ["tmux"]
+    if tmux_socket:
+        cmd += ["-S", tmux_socket]
+    cmd += ["display-message", "-t", pane_id, "-p", "#{window_name}"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.rstrip("\n")
+    return value or None
 
 
 def _operation_from_argv(argv: list[str]) -> str:
@@ -663,6 +683,40 @@ def register(
         )
     display_addr = target.pane
     requested_protocol = ConsumerProtocol(consumer_protocol)
+    host_session_id = None
+    host_session_title = None
+    if requested_protocol is ConsumerProtocol.FIRST_MATE_V1:
+        if not is_first_mate_session_title(name):
+            raise click.ClickException("invalid first-mate logical session name")
+        attestation = load_host_session_attestation(
+            store.db_path, tmux_session, tmux_socket, pane_id,
+        )
+        window_name = _window_name_for_pane(tmux_socket, pane_id)
+        expected = (
+            agent_kind.value, target.pid, start_identity, target.cwd, name,
+            hook_module_sha256(),
+        )
+        actual = (
+            attestation.get("agent_kind") if attestation else None,
+            attestation.get("pid") if attestation else None,
+            attestation.get("process_start_identity") if attestation else None,
+            attestation.get("cwd") if attestation else None,
+            attestation.get("host_session_title") if attestation else None,
+            attestation.get("code_sha256") if attestation else None,
+        )
+        host_session_id = (
+            attestation.get("host_session_id") if attestation else None
+        )
+        if (
+            actual != expected
+            or window_name != name
+            or not isinstance(host_session_id, str)
+            or not host_session_id
+        ):
+            raise click.ClickException(
+                "first-mate host session attestation does not match target"
+            )
+        host_session_title = name
     existing_agent = store.get_agent_by_name(name, tmux_session, tmux_socket)
     existing_generation = (
         activation_generation(store.db_path, existing_agent)
@@ -683,6 +737,8 @@ def register(
             cwd=target.cwd,
             consumer_protocol=requested_protocol,
             process_start_identity=start_identity,
+            host_session_id=host_session_id,
+            host_session_title=host_session_title,
         )
         provisional_receipt = write_activation(store.db_path, provisional)
 
@@ -698,6 +754,8 @@ def register(
             cwd=target.cwd,
             consumer_protocol=requested_protocol,
             process_start_identity=start_identity,
+            host_session_id=host_session_id,
+            host_session_title=host_session_title,
         )
     except ValueError as exc:
         if (
@@ -806,6 +864,44 @@ def retarget(
         raise click.ClickException(
             f"cannot prove process-start identity for pane {pane}"
         )
+    if (
+        previous
+        and previous.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
+        and replace_candidate
+    ):
+        if candidate is None:
+            raise click.ClickException("replace candidate is not active")
+        attestation = load_host_session_attestation(
+            store.db_path, tmux_session, tmux_socket, pane,
+        )
+        window_name = _window_name_for_pane(tmux_socket, pane)
+        expected = (
+            candidate.agent_kind.value,
+            candidate.pid,
+            candidate.process_start_identity,
+            candidate.cwd,
+            candidate.host_session_id,
+            candidate.host_session_title,
+            hook_module_sha256(),
+        )
+        actual = (
+            attestation.get("agent_kind") if attestation else None,
+            attestation.get("pid") if attestation else None,
+            attestation.get("process_start_identity") if attestation else None,
+            attestation.get("cwd") if attestation else None,
+            attestation.get("host_session_id") if attestation else None,
+            attestation.get("host_session_title") if attestation else None,
+            attestation.get("code_sha256") if attestation else None,
+        )
+        if (
+            candidate.consumer_protocol is not ConsumerProtocol.FIRST_MATE_V1
+            or actual != expected
+            or window_name != candidate.name
+            or candidate.host_session_title != candidate.name
+        ):
+            raise click.ClickException(
+                "candidate window/title identity does not match target"
+            )
     projected = None
     if (
         previous
@@ -856,7 +952,17 @@ def retarget(
             expected_generation=candidate_generation,
         )
     if json_output:
-        emit_json("retarget", {"agent": agent_payload(agent)})
+        emit_json("retarget", {
+            "agent": agent_payload(agent),
+            "host_session_transition": {
+                "previous_id": previous.host_session_id if previous else None,
+                "previous_title": (
+                    previous.host_session_title if previous else None
+                ),
+                "current_id": agent.host_session_id,
+                "current_title": agent.host_session_title,
+            },
+        })
     else:
         click.echo(f"Retargeted '{agent.name}' to {agent.display_addr or agent.pane_id}")
 

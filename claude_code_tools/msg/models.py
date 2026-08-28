@@ -72,6 +72,8 @@ class Agent:
     last_seen: str = field(default_factory=_now_iso)
     consumer_protocol: ConsumerProtocol = ConsumerProtocol.LEGACY
     process_start_identity: str | None = None
+    host_session_id: str | None = None
+    host_session_title: str | None = None
 
 
 @dataclass(frozen=True)

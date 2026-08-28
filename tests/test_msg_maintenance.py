@@ -11,6 +11,7 @@ import sys
 import pytest
 
 from claude_code_tools.msg import maintenance
+from claude_code_tools.msg.migrations import CURRENT_SCHEMA_VERSION
 from tests.test_msg_migrations import create_frozen_v3_fixture
 
 
@@ -92,7 +93,7 @@ maintenance.migrate(sys.argv[1], b"crash-token", _failpoint=failpoint)
 
     assert result.returncode == 72
     retried = maintenance.migrate(db_path, b"crash-token")
-    assert retried["to_schema_version"] == 4
+    assert retried["to_schema_version"] == CURRENT_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize("stage", ("before_unlink", "after_unlink", "after_dir_fsync"))

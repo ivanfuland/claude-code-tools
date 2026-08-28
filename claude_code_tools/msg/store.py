@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from .activation import is_first_mate_session_title
 from .migrations import adopt_unique_legacy_registration, initialize_database
 from .models import (
     Agent,
@@ -17,8 +18,8 @@ from .models import (
     ContinuationState,
     ContinuationStatus,
     Message,
-    Thread,
     RegistrationIdentity,
+    Thread,
     WatcherHeartbeat,
     _new_uuid,
     _now_iso,
@@ -121,6 +122,8 @@ class MsgStore:
         cwd: str | None = None,
         consumer_protocol: ConsumerProtocol = ConsumerProtocol.LEGACY,
         process_start_identity: str | None = None,
+        host_session_id: str | None = None,
+        host_session_title: str | None = None,
     ) -> Agent:
         """Register an agent, preserving active-session idempotency."""
         _validate_agent_name(name)
@@ -218,13 +221,15 @@ class MsgStore:
                         agent_kind = ?, pid = ?, cwd = ?,
                         last_seen = ?, tmux_socket = ?,
                         consumer_protocol = ?, process_start_identity = ?,
+                        host_session_id = ?, host_session_title = ?,
                         active = 1
                     WHERE session_id = ?""",
                     (
                         pane_id, display_addr,
                         agent_kind.value, pid, cwd,
                         now, tmux_socket, consumer_protocol.value,
-                        process_start_identity, session_id,
+                        process_start_identity, host_session_id,
+                        host_session_title, session_id,
                     ),
                 )
             else:
@@ -235,14 +240,16 @@ class MsgStore:
                         tmux_session, tmux_socket,
                         display_addr, agent_kind, pid, cwd,
                         registered_at, last_seen,
-                        consumer_protocol, process_start_identity
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        consumer_protocol, process_start_identity,
+                        host_session_id, host_session_title
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id, name, pane_id,
                         tmux_session, tmux_socket,
                         display_addr, agent_kind.value,
                         pid, cwd, now, now,
                         consumer_protocol.value, process_start_identity,
+                        host_session_id, host_session_title,
                     ),
                 )
             conn.commit()
@@ -263,6 +270,8 @@ class MsgStore:
             last_seen=now,
             consumer_protocol=consumer_protocol,
             process_start_identity=process_start_identity,
+            host_session_id=host_session_id,
+            host_session_title=host_session_title,
         )
 
     def get_agent_by_name(
@@ -409,6 +418,8 @@ class MsgStore:
             if replace_candidate_session_id is None:
                 if occupied:
                     raise ValueError("target pane already has an active msg registration")
+                next_host_session_id = current["host_session_id"]
+                next_host_session_title = current["host_session_title"]
             else:
                 requested_kind = agent_kind or AgentKind(current["agent_kind"])
                 expected_identity = (
@@ -465,6 +476,51 @@ class MsgStore:
                 )
                 if expected_identity != candidate_identity:
                     raise ValueError("candidate identity mismatch")
+                next_host_session_id = candidate["host_session_id"]
+                first_mate_retarget = (
+                    current["consumer_protocol"]
+                    == ConsumerProtocol.FIRST_MATE_V1.value
+                )
+                if (
+                    first_mate_retarget
+                    and (
+                        not next_host_session_id
+                        or candidate["consumer_protocol"]
+                        != ConsumerProtocol.FIRST_MATE_V1.value
+                        or not candidate["host_session_title"]
+                        or candidate["host_session_title"] != candidate["name"]
+                        or not is_first_mate_session_title(candidate["name"])
+                        or not candidate["name"].startswith(
+                            f"{current['name']}-candidate-"
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "candidate name/title/host session identity is invalid"
+                    )
+                if first_mate_retarget:
+                    reused = conn.execute(
+                        """SELECT 1 FROM agents
+                        WHERE active = 0 AND session_id != ?
+                        AND tmux_session = ?
+                        AND (tmux_socket IS ? OR tmux_socket = ?)
+                        AND name LIKE ? LIMIT 1""",
+                        (
+                            candidate["session_id"],
+                            candidate["tmux_session"],
+                            candidate["tmux_socket"],
+                            candidate["tmux_socket"],
+                            f"{candidate['name']}@retired:%",
+                        ),
+                    ).fetchone()
+                    if reused:
+                        raise ValueError("candidate generation was reused")
+                next_host_session_title = (
+                    current["name"]
+                    if current["consumer_protocol"]
+                    == ConsumerProtocol.FIRST_MATE_V1.value
+                    else candidate["host_session_title"]
+                )
                 conn.execute(
                     RELEASE_EXPIRED_SQL,
                     (now, candidate["session_id"], candidate["session_id"]),
@@ -505,11 +561,12 @@ class MsgStore:
             conn.execute(
                 """UPDATE agents SET pane_id = ?, display_addr = ?,
                     agent_kind = ?, pid = ?, cwd = ?, process_start_identity = ?,
-                    last_seen = ?
+                    host_session_id = ?, host_session_title = ?, last_seen = ?
                 WHERE session_id = ? AND active = 1""",
                 (
                     pane_id, display_addr, next_kind.value, next_pid, next_cwd,
-                    next_start, _now_iso(), session_id,
+                    next_start, next_host_session_id, next_host_session_title,
+                    _now_iso(), session_id,
                 ),
             )
             if _failpoint:
@@ -1595,4 +1652,6 @@ class MsgStore:
             last_seen=row["last_seen"],
             consumer_protocol=ConsumerProtocol(row["consumer_protocol"]),
             process_start_identity=row["process_start_identity"],
+            host_session_id=row["host_session_id"],
+            host_session_title=row["host_session_title"],
         )

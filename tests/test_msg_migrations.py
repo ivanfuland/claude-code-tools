@@ -19,7 +19,6 @@ from claude_code_tools.msg.models import (
 )
 from claude_code_tools.msg.store import MsgStore
 
-
 FROZEN_V3_SCHEMA = (
     """CREATE TABLE agents (
         session_id TEXT PRIMARY KEY, name TEXT NOT NULL,
@@ -90,6 +89,53 @@ def create_frozen_v3_fixture(path) -> None:
         conn.execute("PRAGMA user_version = 3")
 
 
+def create_frozen_v4_fixture(path) -> None:
+    """Create actual v4 bytes without running current migration code."""
+    create_frozen_v3_fixture(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "ALTER TABLE agents ADD COLUMN consumer_protocol "
+            "TEXT NOT NULL DEFAULT 'legacy'"
+        )
+        conn.execute(
+            "ALTER TABLE agents ADD COLUMN process_start_identity TEXT"
+        )
+        for column, declaration in (
+            ("process_start_identity", "TEXT"),
+            ("distribution_version", "TEXT"),
+            ("module_sha256", "TEXT"),
+            ("db_schema_version", "INTEGER"),
+        ):
+            conn.execute(
+                f"ALTER TABLE watcher_heartbeat ADD COLUMN "
+                f"{column} {declaration}"
+            )
+        conn.execute(
+            """CREATE TABLE continuation_leases (
+                agent_id TEXT PRIMARY KEY REFERENCES agents(session_id)
+                    ON DELETE CASCADE,
+                generation TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """UPDATE agents SET consumer_protocol = 'first-mate.v1',
+                pid = 101, process_start_identity = 'linux:101:1'
+            WHERE session_id = 'legacy-agent'"""
+        )
+        conn.execute(
+            """INSERT INTO continuation_leases (
+                agent_id, generation, expires_at, updated_at
+            ) VALUES (
+                'legacy-agent', 'assignment',
+                '2027-01-01T00:01:30+00:00',
+                '2027-01-01T00:00:00+00:00'
+            )"""
+        )
+        conn.execute("PRAGMA user_version = 4")
+
+
 def test_version_three_adds_first_mate_fields_without_losing_history(tmp_path):
     path = tmp_path / "legacy-v3.db"
     create_frozen_v3_fixture(path)
@@ -100,7 +146,7 @@ def test_version_three_adds_first_mate_fields_without_losing_history(tmp_path):
     assert migrated.consumer_protocol is ConsumerProtocol.LEGACY
     assert migrated.process_start_identity is None
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert conn.execute("SELECT body FROM messages").fetchone()[0] == (
             "historical"
         )
@@ -127,36 +173,36 @@ def test_version_three_adds_first_mate_fields_without_losing_history(tmp_path):
     assert "continuation_leases" in tables
 
 
-def test_version_four_reopen_preserves_continuation_data(tmp_path):
-    path = tmp_path / "reopen-v4.db"
-    store = MsgStore(str(path))
-    agent = store.register_agent(
-        "control", "%1", "main", AgentKind.CLAUDE,
-        pid=101,
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
-        process_start_identity="linux:101:1",
-    )
-    store.set_continuation(
-        RegistrationIdentity.from_agent(agent),
-        "assignment",
-        ttl_secs=90,
-    )
+def test_version_four_to_five_preserves_history_and_continuation(tmp_path):
+    path = tmp_path / "frozen-v4.db"
+    create_frozen_v4_fixture(path)
 
-    reopened = MsgStore(str(path))
+    migrated = MsgStore(str(path))
 
-    assert reopened.get_continuation_status(agent.session_id).generation == (
+    assert migrated.get_continuation_status("legacy-agent").generation == (
         "assignment"
     )
+    agent = migrated.get_agent_by_id("legacy-agent")
+    assert agent.host_session_id is None
+    assert agent.host_session_title is None
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert conn.execute(
             "SELECT count(*) FROM continuation_leases"
         ).fetchone()[0] == 1
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(agents)")
+        }
+        assert conn.execute("SELECT body FROM messages").fetchone() == (
+            "historical",
+        )
+        assert conn.execute("SELECT count(*) FROM deliveries").fetchone() == (1,)
+    assert {"host_session_id", "host_session_title"} <= columns
 
 
 def test_version_four_migration_failure_rolls_back_every_schema_change(tmp_path):
-    path = tmp_path / "rollback-v3.db"
-    create_frozen_v3_fixture(path)
+    path = tmp_path / "rollback-v4.db"
+    create_frozen_v4_fixture(path)
     conn = sqlite3.connect(path)
     alter_calls = 0
 
@@ -174,7 +220,7 @@ def test_version_four_migration_failure_rolls_back_every_schema_change(tmp_path)
     conn.close()
 
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         agent_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(agents)")
         }
@@ -191,31 +237,32 @@ def test_version_four_migration_failure_rolls_back_every_schema_change(tmp_path)
         assert conn.execute("SELECT body FROM messages").fetchone()[0] == (
             "historical"
         )
-    assert "consumer_protocol" not in agent_columns
+    assert {"consumer_protocol", "process_start_identity"} <= agent_columns
+    assert {"host_session_id", "host_session_title"}.isdisjoint(agent_columns)
     assert {
         "process_start_identity",
         "distribution_version",
         "module_sha256",
         "db_schema_version",
-    }.isdisjoint(watcher_columns)
-    assert "continuation_leases" not in tables
+    } <= watcher_columns
+    assert "continuation_leases" in tables
 
     reopened = MsgStore(str(path))
     assert reopened.get_agent_by_id("legacy-agent") is not None
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert conn.execute("SELECT body FROM messages").fetchone() == (
             "historical",
         )
 
 
 def test_future_schema_is_rejected_before_database_bytes_change(tmp_path):
-    path = tmp_path / "future-v5.db"
+    path = tmp_path / "future-v6.db"
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE future_only (marker TEXT NOT NULL)")
         conn.execute("INSERT INTO future_only VALUES ('keep')")
-        conn.execute("PRAGMA user_version = 5")
+        conn.execute("PRAGMA user_version = 6")
     before = path.read_bytes()
 
     with pytest.raises(UnsupportedSchemaVersion, match="newer than supported"):

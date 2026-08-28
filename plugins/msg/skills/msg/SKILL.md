@@ -29,7 +29,11 @@ First-mate bootstraps its managed sessions with the closed protocol value:
 msg register --consumer-protocol first-mate.v1 --json <your-name>
 ```
 
-The default remains `legacy`.
+The default remains `legacy`. Before this registration, the native
+`SessionStart` hook must have attested the real Claude/Codex host session.
+First-mate names use `<project>-exec-<suffix>_<NN>`; the attested native title
+and tmux window must match exactly. Never pass or invent a host session ID on
+the command line.
 
 ## Sending Messages
 
@@ -69,10 +73,12 @@ helper owns assignment-generation reconciliation and refreshes an existing
 continuation heartbeat every 45 seconds with a 90-second TTL. The hooks never
 create or replace a generation.
 
-Plugin-native `PostToolUse`, `Stop`, and `UserPromptSubmit` hooks keep an armed
-responsibility in the agent loop. A stale heartbeat routes to recovery; it
-does not clear responsibility. First-mate delivery never uses tmux prompt
-injection.
+Plugin-native `SessionStart`, `PostToolUse`, `Stop`, and `UserPromptSubmit`
+hooks attest the resumable host session and keep an armed responsibility in
+the agent loop. A stale heartbeat routes to recovery; it does not clear
+responsibility or classify the Agent as parked/dead. Exact clear with no
+pending delivery allows Stop, so a parked Agent does not self-start another
+turn. First-mate delivery never uses tmux prompt injection.
 
 Codex treats plugin hooks as non-managed code and skips changed definitions
 until the user reviews and trusts the current hash in `/hooks`. Never bypass

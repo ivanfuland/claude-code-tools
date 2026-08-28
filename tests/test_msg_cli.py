@@ -10,13 +10,20 @@ import pytest
 from click.testing import CliRunner
 
 from claude_code_tools.amux.model import Agent as AmuxAgent
-from claude_code_tools.msg.activation import load_activation, write_activation
+from claude_code_tools.msg.activation import (
+    load_activation,
+    write_activation,
+    write_host_session_attestation,
+)
 from claude_code_tools.msg.cli import (
     _ensure_watcher_running,
     _get_exact_self_agent,
     _get_self_agent,
     cli,
 )
+from claude_code_tools.msg.hooks import hook_module_sha256
+from claude_code_tools.msg.json_contract import agent_payload
+from claude_code_tools.msg.migrations import CURRENT_SCHEMA_VERSION
 from claude_code_tools.msg.models import (
     Agent,
     AgentKind,
@@ -123,15 +130,36 @@ def patch_target_agent(
     )
 
 
+def attest_target(monkeypatch, store, name="example-exec-tests_01"):
+    monkeypatch.setattr(
+        "claude_code_tools.msg.cli._window_name_for_pane",
+        lambda _socket, _pane: name,
+    )
+    write_host_session_attestation(
+        store.db_path,
+        tmux_session="main",
+        tmux_socket="/tmp/tmux-main",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=4242,
+        process_start_identity="linux:4242:100",
+        cwd="/repo",
+        host_session_id=f"host:{name}",
+        host_session_title=name,
+        code_sha256=hook_module_sha256(),
+    )
+
+
 def test_register_json_persists_consumer_protocol(monkeypatch, tmp_path):
     store = MsgStore(tmp_path / "msg.db")
     patch_cli_runtime(monkeypatch, store)
     patch_target_agent(monkeypatch)
+    attest_target(monkeypatch, store)
 
     result = CliRunner().invoke(
         cli,
         [
-            "register", "executor", "--pane", "%2",
+            "register", "example-exec-tests_01", "--pane", "%2",
             "--consumer-protocol", "first-mate.v1", "--json",
         ],
     )
@@ -139,7 +167,9 @@ def test_register_json_persists_consumer_protocol(monkeypatch, tmp_path):
     payload = machine_payload(result)
     assert payload["operation"] == "register"
     assert payload["data"]["agent"]["consumer_protocol"] == "first-mate.v1"
-    loaded = store.get_agent_by_name("executor", "main", "/tmp/tmux-main")
+    loaded = store.get_agent_by_name(
+        "example-exec-tests_01", "main", "/tmp/tmux-main",
+    )
     assert loaded.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
     assert (loaded.pid, loaded.process_start_identity, loaded.cwd) == (
         4242, "linux:4242:100", "/repo",
@@ -148,12 +178,116 @@ def test_register_json_persists_consumer_protocol(monkeypatch, tmp_path):
     assert marker["session_id"] == loaded.session_id
 
 
+def test_first_mate_register_consumes_exact_host_attestation(
+    monkeypatch, tmp_path,
+):
+    store = MsgStore(tmp_path / "msg.db")
+    patch_cli_runtime(monkeypatch, store)
+    patch_target_agent(monkeypatch)
+    attest_target(monkeypatch, store)
+    monkeypatch.setattr(
+        "claude_code_tools.msg.cli._window_name_for_pane",
+        lambda _socket, _pane: "example-exec-docs_01",
+        raising=False,
+    )
+    write_host_session_attestation(
+        store.db_path,
+        tmux_session="main",
+        tmux_socket="/tmp/tmux-main",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=4242,
+        process_start_identity="linux:4242:100",
+        cwd="/repo",
+        host_session_id="019d-host-session",
+        host_session_title="example-exec-docs_01",
+        code_sha256=hook_module_sha256(),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "register", "example-exec-docs_01", "--pane", "%2",
+            "--consumer-protocol", "first-mate.v1", "--json",
+        ],
+    )
+
+    payload = machine_payload(result)
+    agent = payload["data"]["agent"]
+    assert agent["host_session_id"] == "019d-host-session"
+    assert agent["host_session_title"] == "example-exec-docs_01"
+    loaded = store.get_agent_by_id(agent["session_id"])
+    assert loaded.host_session_id == "019d-host-session"
+
+
+@pytest.mark.parametrize(
+    "override,window_name",
+    (
+        ({"agent_kind": AgentKind.CLAUDE}, "example-exec-docs_01"),
+        ({"pid": 4243}, "example-exec-docs_01"),
+        ({"process_start_identity": "linux:4242:reused"}, "example-exec-docs_01"),
+        ({"cwd": "/stale"}, "example-exec-docs_01"),
+        ({"host_session_title": "example-exec-other_01"}, "example-exec-docs_01"),
+        ({"code_sha256": "b" * 64}, "example-exec-docs_01"),
+        ({}, "drifted-window"),
+    ),
+)
+def test_first_mate_register_rejects_stale_or_cross_harness_attestation(
+    monkeypatch, tmp_path, override, window_name,
+):
+    store = MsgStore(tmp_path / "msg.db")
+    patch_cli_runtime(monkeypatch, store)
+    patch_target_agent(monkeypatch)
+    values = {
+        "tmux_session": "main",
+        "tmux_socket": "/tmp/tmux-main",
+        "pane_id": "%2",
+        "agent_kind": AgentKind.CODEX,
+        "pid": 4242,
+        "process_start_identity": "linux:4242:100",
+        "cwd": "/repo",
+        "host_session_id": "019d-host-session",
+        "host_session_title": "example-exec-docs_01",
+        "code_sha256": hook_module_sha256(),
+    }
+    values.update(override)
+    write_host_session_attestation(store.db_path, **values)
+    monkeypatch.setattr(
+        "claude_code_tools.msg.cli._window_name_for_pane",
+        lambda _socket, _pane: window_name,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "register", "example-exec-docs_01", "--pane", "%2",
+            "--consumer-protocol", "first-mate.v1", "--json",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "host session attestation does not match target" in result.output
+    assert store.list_agents("main") == []
+
+
+def test_agent_payload_exposes_host_session_identity():
+    payload = agent_payload(Agent(
+        name="example-exec-docs_01",
+        host_session_id="019d-host-session",
+        host_session_title="example-exec-docs_01",
+    ))
+
+    assert payload["host_session_id"] == "019d-host-session"
+    assert payload["host_session_title"] == "example-exec-docs_01"
+
+
 def test_first_mate_register_publishes_activation_before_db_commit(
     monkeypatch, tmp_path,
 ):
     store = MsgStore(tmp_path / "msg.db")
     patch_cli_runtime(monkeypatch, store)
     patch_target_agent(monkeypatch)
+    attest_target(monkeypatch, store)
     original = store.register_agent
 
     def guarded_register(*args, **kwargs):
@@ -170,7 +304,7 @@ def test_first_mate_register_publishes_activation_before_db_commit(
         CliRunner().invoke(
             cli,
             [
-                "register", "executor", "--pane", "%2",
+                "register", "example-exec-tests_01", "--pane", "%2",
                 "--consumer-protocol", "first-mate.v1", "--json",
             ],
         )
@@ -186,19 +320,42 @@ def test_retarget_json_replaces_exact_candidate_and_refreshes_identity(
 ):
     store = MsgStore(tmp_path / "msg.db")
     stable = store.register_agent(
-        "control", "%1", "main", AgentKind.CLAUDE, "/tmp/tmux-main",
+        "example-exec-control_01", "%1", "main", AgentKind.CLAUDE,
+        "/tmp/tmux-main",
         pid=101, cwd="/old", process_start_identity="linux:101:10",
         consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        host_session_id="host-control",
+        host_session_title="example-exec-control_01",
     )
     candidate = store.register_agent(
-        "candidate", "%2", "main", AgentKind.CODEX, "/tmp/tmux-main",
+        "example-exec-control_01-candidate-a1", "%2", "main",
+        AgentKind.CODEX, "/tmp/tmux-main",
         pid=4242, cwd="/repo", process_start_identity="linux:4242:100",
         consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        host_session_id="host-candidate",
+        host_session_title="example-exec-control_01-candidate-a1",
     )
     write_activation(store.db_path, stable)
     write_activation(store.db_path, candidate)
+    write_host_session_attestation(
+        store.db_path,
+        tmux_session="main",
+        tmux_socket="/tmp/tmux-main",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=4242,
+        process_start_identity="linux:4242:100",
+        cwd="/repo",
+        host_session_id="host-candidate",
+        host_session_title="example-exec-control_01-candidate-a1",
+        code_sha256=hook_module_sha256(),
+    )
     patch_cli_runtime(monkeypatch, store)
     patch_target_agent(monkeypatch)
+    monkeypatch.setattr(
+        "claude_code_tools.msg.cli._window_name_for_pane",
+        lambda _socket, _pane: "example-exec-control_01-candidate-a1",
+    )
 
     payload = machine_payload(
         CliRunner().invoke(
@@ -214,6 +371,12 @@ def test_retarget_json_replaces_exact_candidate_and_refreshes_identity(
     assert payload["operation"] == "retarget"
     assert payload["data"]["agent"]["session_id"] == stable.session_id
     assert payload["data"]["agent"]["agent_kind"] == "codex"
+    assert payload["data"]["host_session_transition"] == {
+        "previous_id": "host-control",
+        "previous_title": "example-exec-control_01",
+        "current_id": "host-candidate",
+        "current_title": "example-exec-control_01",
+    }
     assert [item.session_id for item in store.list_agents("main")] == [
         stable.session_id,
     ]
@@ -224,6 +387,65 @@ def test_retarget_json_replaces_exact_candidate_and_refreshes_identity(
         store.db_path, "main", "/tmp/tmux-main", "%2",
     )
     assert marker["session_id"] == stable.session_id
+
+
+def test_retarget_first_mate_rejects_candidate_window_drift(
+    monkeypatch, tmp_path,
+):
+    store = MsgStore(tmp_path / "msg.db")
+    stable = store.register_agent(
+        "example-exec-docs_01", "%1", "main", AgentKind.CLAUDE,
+        "/tmp/tmux-main", pid=101, cwd="/old",
+        process_start_identity="linux:101:10",
+        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        host_session_id="host-control",
+        host_session_title="example-exec-docs_01",
+    )
+    candidate = store.register_agent(
+        "example-exec-docs_01-candidate-a1", "%2", "main",
+        AgentKind.CODEX, "/tmp/tmux-main", pid=4242, cwd="/repo",
+        process_start_identity="linux:4242:100",
+        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        host_session_id="host-control",
+        host_session_title="example-exec-docs_01-candidate-a1",
+    )
+    write_activation(store.db_path, stable)
+    write_activation(store.db_path, candidate)
+    write_host_session_attestation(
+        store.db_path,
+        tmux_session="main",
+        tmux_socket="/tmp/tmux-main",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=4242,
+        process_start_identity="linux:4242:100",
+        cwd="/repo",
+        host_session_id="host-control",
+        host_session_title="example-exec-docs_01-candidate-a1",
+        code_sha256=hook_module_sha256(),
+    )
+    patch_cli_runtime(monkeypatch, store)
+    patch_target_agent(monkeypatch)
+    monkeypatch.setattr(
+        "claude_code_tools.msg.cli._window_name_for_pane",
+        lambda _socket, _pane: "drifted-window",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "retarget", "--session-id", stable.session_id,
+            "--pane", "%2", "--replace-candidate", candidate.session_id,
+            "--json",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "candidate window/title identity does not match target" in result.output
+    assert store.get_agent_by_id(stable.session_id).pane_id == "%1"
+    assert candidate.session_id in {
+        agent.session_id for agent in store.list_agents("main")
+    }
 
 
 def test_list_json_returns_complete_agents(monkeypatch, tmp_path):
@@ -247,7 +469,7 @@ def test_status_json_reports_watcher_identity_mismatch(monkeypatch, tmp_path):
         process_start_identity="linux:5151:88",
         distribution_version="1.25.6",
         module_sha256="old-hash",
-        db_schema_version=4,
+        db_schema_version=CURRENT_SCHEMA_VERSION,
     )
     patch_cli_runtime(monkeypatch, store)
     monkeypatch.setattr(
@@ -309,7 +531,7 @@ def test_watch_status_json_uses_same_exact_identity_contract(monkeypatch, tmp_pa
         process_start_identity="linux:5151:88",
         distribution_version="1.25.6",
         module_sha256="hash",
-        db_schema_version=4,
+        db_schema_version=CURRENT_SCHEMA_VERSION,
     )
     patch_cli_runtime(monkeypatch, store)
     monkeypatch.setattr(
@@ -341,7 +563,7 @@ def test_watch_stop_rejects_reused_pid_without_signalling(monkeypatch, tmp_path)
         process_start_identity="linux:5151:old",
         distribution_version="1.25.6",
         module_sha256="hash",
-        db_schema_version=4,
+        db_schema_version=CURRENT_SCHEMA_VERSION,
     )
     patch_cli_runtime(monkeypatch, store)
     monkeypatch.setattr(
@@ -367,7 +589,7 @@ def test_watch_start_waits_for_matching_heartbeat(monkeypatch, tmp_path):
         process_start_identity="linux:6161:99",
         distribution_version="1.25.6",
         module_sha256="hash",
-        db_schema_version=4,
+        db_schema_version=CURRENT_SCHEMA_VERSION,
     )
     observations = iter(
         (
@@ -406,7 +628,7 @@ def test_implicit_watcher_start_replaces_fresh_mismatched_identity(
         process_start_identity="linux:6161:99",
         distribution_version="old",
         module_sha256="old-hash",
-        db_schema_version=4,
+        db_schema_version=CURRENT_SCHEMA_VERSION,
     )
     observations = iter(
         (
@@ -546,7 +768,10 @@ def test_maintenance_migrate_upgrades_only_with_exact_token(tmp_path):
     )
 
     payload = machine_payload(migrated)
-    assert payload["data"] == {"from_schema_version": 3, "to_schema_version": 4}
+    assert payload["data"] == {
+        "from_schema_version": 3,
+        "to_schema_version": CURRENT_SCHEMA_VERSION,
+    }
 
 
 def test_maintenance_future_schema_is_untouched(tmp_path):
@@ -1122,10 +1347,13 @@ def test_auto_started_watcher_uses_selected_database(monkeypatch, tmp_path):
     ]]
 
 
-def test_unregister_exact_session(tmp_path):
+def test_unregister_exact_session(monkeypatch, tmp_path):
     path = tmp_path / "msg.db"
     store = MsgStore(path)
     agent = store.register_agent("lane-4", "%4", "moscow", AgentKind.CODEX)
+    monkeypatch.setattr(
+        "claude_code_tools.msg.cli._ensure_watcher_running", lambda _store: None,
+    )
 
     result = CliRunner().invoke(
         cli, ["--db", str(path), "unregister", "--session-id", agent.session_id]
@@ -1136,7 +1364,7 @@ def test_unregister_exact_session(tmp_path):
     assert store.get_agent_by_id(agent.session_id) is not None
 
 
-def test_unregister_refuses_unread_delivery(tmp_path):
+def test_unregister_refuses_unread_delivery(monkeypatch, tmp_path):
     path = tmp_path / "msg.db"
     store = MsgStore(path)
     sender = store.register_agent("moscow", "%1", "moscow", AgentKind.CLAUDE)
@@ -1145,6 +1373,9 @@ def test_unregister_refuses_unread_delivery(tmp_path):
         "work", sender.session_id, [sender.session_id, recipient.session_id]
     )
     store.send_message(thread.id, sender.session_id, "fix this")
+    monkeypatch.setattr(
+        "claude_code_tools.msg.cli._ensure_watcher_running", lambda _store: None,
+    )
 
     result = CliRunner().invoke(
         cli, ["--db", str(path), "unregister", "--session-id", recipient.session_id]

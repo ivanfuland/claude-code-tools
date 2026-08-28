@@ -6,7 +6,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 class UnsupportedSchemaVersion(RuntimeError):
@@ -27,6 +27,8 @@ SCHEMA_STATEMENTS = (
         last_seen TEXT NOT NULL,
         consumer_protocol TEXT NOT NULL DEFAULT 'legacy',
         process_start_identity TEXT,
+        host_session_id TEXT,
+        host_session_title TEXT,
         active INTEGER NOT NULL DEFAULT 1,
         UNIQUE(name, tmux_session, tmux_socket)
     )""",
@@ -241,6 +243,16 @@ def initialize_database(conn: sqlite3.Connection) -> None:
                         f"ALTER TABLE watcher_heartbeat ADD COLUMN "
                         f"{column} {declaration}"
                     )
+        if version < 5:
+            agent_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(agents)")
+            }
+            if "host_session_id" not in agent_columns:
+                conn.execute("ALTER TABLE agents ADD COLUMN host_session_id TEXT")
+            if "host_session_title" not in agent_columns:
+                conn.execute(
+                    "ALTER TABLE agents ADD COLUMN host_session_title TEXT"
+                )
         if version < CURRENT_SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
         conn.commit()

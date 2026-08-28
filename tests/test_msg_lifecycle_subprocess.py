@@ -16,10 +16,13 @@ from pathlib import Path
 import pytest
 
 from claude_code_tools.amux.scan import resolve_pane_agent
+from claude_code_tools.msg.activation import write_host_session_attestation
+from claude_code_tools.msg.hooks import hook_module_sha256
+from claude_code_tools.msg.migrations import CURRENT_SCHEMA_VERSION
 from claude_code_tools.msg.models import AgentKind
+from claude_code_tools.msg.store import MsgStore
 from claude_code_tools.msg.watcher import distribution_version, watcher_module_sha256
 from claude_code_tools.process_identity import process_start_identity
-from claude_code_tools.msg.store import MsgStore
 from tests.test_msg_migrations import create_frozen_v3_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +91,32 @@ def row_count_snapshot(db_path: Path) -> dict[str, int]:
 
 def stop_watcher(db_path: Path, *, cwd: Path = ROOT, env=None) -> None:
     run_msg(["--db", str(db_path), "watch", "stop", "--json"], cwd=cwd, env=env)
+
+
+def attest_pane(
+    db_path: Path, socket_path: Path, session: str, pane: str, name: str,
+) -> None:
+    subprocess.run(
+        ["tmux", "-S", str(socket_path), "rename-window", "-t", pane, name],
+        check=True, capture_output=True, text=True,
+    )
+    target = resolve_pane_agent(pane, str(socket_path))
+    assert target is not None
+    start = process_start_identity(target.pid)
+    assert start is not None
+    write_host_session_attestation(
+        db_path,
+        tmux_session=session,
+        tmux_socket=str(socket_path),
+        pane_id=pane,
+        agent_kind=AgentKind(target.kind),
+        pid=target.pid,
+        process_start_identity=start,
+        cwd=target.cwd,
+        host_session_id=f"host:{name}",
+        host_session_title=name,
+        code_sha256=hook_module_sha256(),
+    )
 
 
 @contextmanager
@@ -211,21 +240,29 @@ def test_real_tmux_register_retarget_and_continuation_identity(
         source_pane, target_pane = panes
         base_env = os.environ.copy()
         base_env["TMUX"] = f"{socket_path},0,0"
+        logical_name = "fixture-exec-test_01"
+        candidate_name = f"{logical_name}-candidate-a1"
         try:
+            attest_pane(
+                db_path, socket_path, session, source_pane, logical_name,
+            )
             source = json_result(
                 run_msg(
                     [
-                        "--db", str(db_path), "register", "control",
+                        "--db", str(db_path), "register", logical_name,
                         "--pane", source_pane, "--consumer-protocol",
                         "first-mate.v1", "--json",
                     ],
                     env=base_env,
                 )
             )["data"]["agent"]
+            attest_pane(
+                db_path, socket_path, session, target_pane, candidate_name,
+            )
             candidate = json_result(
                 run_msg(
                     [
-                        "--db", str(db_path), "register", "candidate",
+                        "--db", str(db_path), "register", candidate_name,
                         "--pane", target_pane, "--consumer-protocol",
                         "first-mate.v1", "--json",
                     ],
@@ -347,21 +384,29 @@ def test_real_tmux_peek_then_explicit_ack(tmp_path):
         base_env = os.environ.copy()
         base_env["TMUX"] = f"{socket_path},0,0"
         fake_watcher_id = "test-non-delivering-heartbeat"
+        sender_name = "fixture-exec-sender_01"
+        recipient_name = "fixture-exec-recipient_02"
         try:
+            attest_pane(
+                db_path, socket_path, session, sender_pane, sender_name,
+            )
             sender = json_result(
                 run_msg(
                     [
-                        "--db", str(db_path), "register", "sender",
+                        "--db", str(db_path), "register", sender_name,
                         "--pane", sender_pane, "--consumer-protocol",
                         "first-mate.v1", "--json",
                     ],
                     env=base_env,
                 )
             )["data"]["agent"]
+            attest_pane(
+                db_path, socket_path, session, recipient_pane, recipient_name,
+            )
             recipient = json_result(
                 run_msg(
                     [
-                        "--db", str(db_path), "register", "recipient",
+                        "--db", str(db_path), "register", recipient_name,
                         "--pane", recipient_pane, "--consumer-protocol",
                         "first-mate.v1", "--json",
                     ],
@@ -536,7 +581,10 @@ def test_real_token_fd_migration_and_postcheck_exit(tmp_path):
         )
     finally:
         os.close(token_fd)
-    assert migrated["data"] == {"from_schema_version": 3, "to_schema_version": 4}
+    assert migrated["data"] == {
+        "from_schema_version": 3,
+        "to_schema_version": CURRENT_SCHEMA_VERSION,
+    }
 
     gates = json.dumps(
         {

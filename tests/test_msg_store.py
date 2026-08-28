@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from claude_code_tools.msg.migrations import CURRENT_SCHEMA_VERSION
 from claude_code_tools.msg.models import (
     AgentKind,
     ConsumerProtocol,
@@ -92,6 +93,23 @@ class TestAgentRegistration:
         assert loaded is not None
         assert loaded.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
         assert loaded.process_start_identity == "linux:4242:100"
+
+    def test_register_persists_resumable_host_session_identity(self, store):
+        agent = store.register_agent(
+            name="example-exec-docs_01",
+            pane_id="%7",
+            tmux_session="test",
+            agent_kind=AgentKind.CODEX,
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            process_start_identity="linux:4242:100",
+            host_session_id="019d-host-session",
+            host_session_title="example-exec-docs_01",
+        )
+
+        loaded = store.get_agent_by_id(agent.session_id)
+        assert loaded is not None
+        assert loaded.host_session_id == "019d-host-session"
+        assert loaded.host_session_title == "example-exec-docs_01"
 
     def test_register_new_agent(self, store):
         agent = store.register_agent(
@@ -467,6 +485,117 @@ class TestAgentRegistration:
             sender.session_id,
             stable.session_id,
         ]
+
+    def test_retarget_moves_candidate_host_session_but_keeps_stable_title(
+        self, store,
+    ):
+        stable = store.register_agent(
+            "example-exec-docs_01", "%2", "test", AgentKind.CLAUDE,
+            pid=102, cwd="/old", process_start_identity="linux:102:10",
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            host_session_id="host-old",
+            host_session_title="example-exec-docs_01",
+        )
+        candidate = store.register_agent(
+            "example-exec-docs_01-candidate-a1", "%9", "test",
+            AgentKind.CODEX,
+            pid=909, cwd="/new", process_start_identity="linux:909:90",
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            host_session_id="host-new",
+            host_session_title="example-exec-docs_01-candidate-a1",
+        )
+
+        moved = store.retarget_agent(
+            stable.session_id,
+            "%9",
+            "test",
+            agent_kind=AgentKind.CODEX,
+            pid=909,
+            cwd="/new",
+            process_start_identity="linux:909:90",
+            replace_candidate_session_id=candidate.session_id,
+        )
+
+        assert moved.session_id == stable.session_id
+        assert moved.name == "example-exec-docs_01"
+        assert moved.host_session_id == "host-new"
+        assert moved.host_session_title == "example-exec-docs_01"
+
+    def test_retarget_first_mate_rejects_non_generation_candidate(self, store):
+        stable = store.register_agent(
+            "example-exec-docs_01", "%2", "test", AgentKind.CLAUDE,
+            pid=102, cwd="/old", process_start_identity="linux:102:10",
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            host_session_id="host-old",
+            host_session_title="example-exec-docs_01",
+        )
+        candidate = store.register_agent(
+            "unrelated", "%9", "test", AgentKind.CODEX,
+            pid=909, cwd="/new", process_start_identity="linux:909:90",
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            host_session_id="host-new",
+            host_session_title="unrelated",
+        )
+
+        with pytest.raises(ValueError, match="candidate name"):
+            store.retarget_agent(
+                stable.session_id,
+                "%9",
+                "test",
+                agent_kind=AgentKind.CODEX,
+                pid=909,
+                cwd="/new",
+                process_start_identity="linux:909:90",
+                replace_candidate_session_id=candidate.session_id,
+            )
+
+        assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
+        assert candidate.session_id in {
+            agent.session_id for agent in store.list_agents("test")
+        }
+
+    def test_retarget_first_mate_rejects_reused_candidate_generation(self, store):
+        stable = store.register_agent(
+            "example-exec-docs_01", "%2", "test", AgentKind.CLAUDE,
+            pid=102, cwd="/old", process_start_identity="linux:102:10",
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            host_session_id="host-old",
+            host_session_title="example-exec-docs_01",
+        )
+        candidate_name = "example-exec-docs_01-candidate-a1"
+        old_candidate = store.register_agent(
+            candidate_name, "%8", "test", AgentKind.CODEX,
+            pid=808, cwd="/old-candidate",
+            process_start_identity="linux:808:80",
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            host_session_id="host-old",
+            host_session_title=candidate_name,
+        )
+        assert store.retire_agent(old_candidate.session_id)
+        candidate = store.register_agent(
+            candidate_name, "%9", "test", AgentKind.CODEX,
+            pid=909, cwd="/new", process_start_identity="linux:909:90",
+            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            host_session_id="host-old",
+            host_session_title=candidate_name,
+        )
+
+        with pytest.raises(ValueError, match="candidate generation was reused"):
+            store.retarget_agent(
+                stable.session_id,
+                "%9",
+                "test",
+                agent_kind=AgentKind.CODEX,
+                pid=909,
+                cwd="/new",
+                process_start_identity="linux:909:90",
+                replace_candidate_session_id=candidate.session_id,
+            )
+
+        assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
+        assert candidate.session_id in {
+            agent.session_id for agent in store.list_agents("test")
+        }
 
     def test_retarget_replace_candidate_retry_returns_committed_stable_identity(
         self, store,
@@ -1596,7 +1725,7 @@ class TestWatcherHeartbeat:
             process_start_identity="linux:1234:55",
             distribution_version="1.26.0",
             module_sha256="a" * 64,
-            db_schema_version=4,
+            db_schema_version=CURRENT_SCHEMA_VERSION,
         )
         info = store.get_watcher_info()
         assert len(info) == 1
@@ -1604,7 +1733,7 @@ class TestWatcherHeartbeat:
         assert info[0].process_start_identity == "linux:1234:55"
         assert info[0].distribution_version == "1.26.0"
         assert info[0].module_sha256 == "a" * 64
-        assert info[0].db_schema_version == 4
+        assert info[0].db_schema_version == CURRENT_SCHEMA_VERSION
 
 
 class TestThreeAgentThread:

@@ -22,6 +22,11 @@ session is registered by the First-mate bootstrap instead:
 msg register --consumer-protocol first-mate.v1 --json $ARGUMENTS
 ```
 
+The First-mate bootstrap must first obtain a native SessionStart attestation.
+Its allocated name, native session title, and tmux window name must match the
+`<project>-exec-<suffix>_<NN>` contract; `msg register` does not accept a
+caller-supplied host session ID.
+
 Do not switch an existing registration between protocols while it owns an
 armed continuation record.
 

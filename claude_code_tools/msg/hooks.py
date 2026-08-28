@@ -10,17 +10,24 @@ to prevent double-notification.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import click
 
 from claude_code_tools.amux.scan import resolve_pane_agent
 from claude_code_tools.process_identity import process_start_identity
 
-from .activation import load_activation
+from .activation import (
+    is_first_mate_session_title,
+    load_activation,
+    load_host_session_attestation,
+    write_host_session_attestation,
+)
 from .models import (
     AgentKind,
     ConsumerProtocol,
@@ -29,6 +36,14 @@ from .models import (
     _new_uuid,
 )
 from .store import DEFAULT_DB_PATH, MsgStore
+
+_LOADED_HOOK_MODULE_SHA256 = hashlib.sha256(
+    Path(__file__).read_bytes(),
+).hexdigest()
+
+
+def hook_module_sha256() -> str:
+    return _LOADED_HOOK_MODULE_SHA256
 
 
 def _current_tmux_scope() -> tuple[str, str | None, str] | None:
@@ -62,6 +77,137 @@ def _current_tmux_locator() -> tuple[str | None, str] | None:
         return None
     tmux_socket = os.environ.get("TMUX", "").split(",", 1)[0] or None
     return tmux_socket, pane_id
+
+
+def _current_window_name(
+    tmux_socket: str | None, pane_id: str,
+) -> str | None:
+    cmd = ["tmux"]
+    if tmux_socket:
+        cmd += ["-S", tmux_socket]
+    cmd += ["display-message", "-t", pane_id, "-p", "#{window_name}"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.rstrip("\n")
+    return value or None
+
+
+def _attest_host_session(hook_input: object) -> None:
+    if not isinstance(hook_input, dict):
+        raise TypeError("hook input is invalid")
+    host_session_id = hook_input.get("session_id")
+    if (
+        not isinstance(host_session_id, str)
+        or not host_session_id
+        or len(host_session_id.encode("utf-8")) > 256
+        or any(ord(character) < 32 or ord(character) == 127
+               for character in host_session_id)
+    ):
+        raise ValueError("host session id is invalid")
+    scope = _current_tmux_scope()
+    if scope is None:
+        raise ValueError("tmux scope is unavailable")
+    tmux_session, tmux_socket, pane_id = scope
+    target = resolve_pane_agent(pane_id, tmux_socket)
+    if target is None:
+        raise ValueError("TUI identity is unavailable")
+    start_identity = process_start_identity(target.pid)
+    title = _current_window_name(tmux_socket, pane_id)
+    if start_identity is None or title is None:
+        raise ValueError("host identity is incomplete")
+    write_host_session_attestation(
+        DEFAULT_DB_PATH,
+        tmux_session=tmux_session,
+        tmux_socket=tmux_socket,
+        pane_id=pane_id,
+        agent_kind=AgentKind(target.kind),
+        pid=target.pid,
+        process_start_identity=start_identity,
+        cwd=target.cwd,
+        host_session_id=host_session_id,
+        host_session_title=title,
+        code_sha256=hook_module_sha256(),
+    )
+
+
+def _set_codex_session_title(host_session_id: str, title: str) -> bool:
+    requests = "\n".join((
+        json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "thread/name/set",
+            "params": {"threadId": host_session_id, "name": title},
+        }),
+        json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "thread/read",
+            "params": {"threadId": host_session_id, "includeTurns": False},
+        }),
+    )) + "\n"
+    try:
+        result = subprocess.run(
+            ["codex", "app-server", "proxy"],
+            input=requests,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0 or result.stderr:
+        return False
+    responses = []
+    for line in result.stdout.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("id") in {1, 2}:
+            responses.append(value)
+    if len(responses) != 2 or any("error" in value for value in responses):
+        return False
+    readback = next(value for value in responses if value.get("id") == 2)
+    return (
+        ((readback.get("result") or {}).get("thread") or {}).get("name")
+        == title
+    )
+
+
+def _bootstrap_title_response(
+    hook_event: str, scope: tuple[str, str | None, str] | None,
+) -> dict | None:
+    if hook_event != "UserPromptSubmit" or scope is None:
+        return None
+    tmux_session, tmux_socket, pane_id = scope
+    attestation = load_host_session_attestation(
+        DEFAULT_DB_PATH, tmux_session, tmux_socket, pane_id,
+    )
+    if not attestation or attestation.get("invalid"):
+        return None
+    title = attestation.get("host_session_title")
+    host_session_id = attestation.get("host_session_id")
+    if (
+        not isinstance(title, str)
+        or not is_first_mate_session_title(title)
+        or not isinstance(host_session_id, str)
+        or not host_session_id
+    ):
+        return None
+    kind = attestation.get("agent_kind")
+    if kind == AgentKind.CLAUDE.value:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "sessionTitle": title,
+            }
+        }
+    if kind == AgentKind.CODEX.value:
+        if not _set_codex_session_title(host_session_id, title):
+            raise ValueError("Codex session title readback failed")
+        return {}
+    return None
 
 
 def _find_self_agent(store: MsgStore) -> object | None:
@@ -116,7 +262,21 @@ def _check_and_notify(
     except (json.JSONDecodeError, EOFError):
         hook_input = {}
 
+    if hook_event == "SessionStart":
+        try:
+            _attest_host_session(hook_input)
+        except (OSError, TypeError, ValueError):
+            _emit_first_mate_recovery(hook_event)
+            return
+        _approve(json_object=True)
+        return
+
     scope = _current_tmux_scope()
+    try:
+        title_response = _bootstrap_title_response(hook_event, scope)
+    except ValueError:
+        _emit_first_mate_recovery(hook_event)
+        return
     marker = None
     if scope is not None:
         marker = load_activation(DEFAULT_DB_PATH, *scope)
@@ -162,6 +322,9 @@ def _check_and_notify(
             return
         raise
     if not me:
+        if title_response is not None:
+            print(json.dumps(title_response))
+            return
         if marker or known_first_mate:
             _emit_first_mate_recovery(hook_event)
             return
@@ -338,6 +501,12 @@ def prompt_submit() -> None:
 def post_tool_use() -> None:
     """PostToolUse hook — refresh an existing continuation heartbeat."""
     _check_and_notify("PostToolUse")
+
+
+@cli.command("session-start")
+def session_start() -> None:
+    """SessionStart hook — attest the resumable host identity."""
+    _check_and_notify("SessionStart")
 
 
 def main() -> None:

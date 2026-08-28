@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
 from claude_code_tools.amux.model import Agent as AmuxAgent
+from claude_code_tools.msg import hooks as hooks_module
+from claude_code_tools.msg.activation import (
+    load_host_session_attestation,
+    write_host_session_attestation,
+)
 from claude_code_tools.msg.hooks import _find_self_agent, cli
 from claude_code_tools.msg.models import (
     Agent,
@@ -153,6 +160,173 @@ class TestStopHook:
                 input=json.dumps({}),
             )
         assert result.output == ""
+
+
+def test_session_start_attests_resumable_host_identity(monkeypatch, tmp_path):
+    db_path = tmp_path / "msg.db"
+    monkeypatch.setattr(
+        "claude_code_tools.msg.hooks.DEFAULT_DB_PATH", str(db_path),
+    )
+    monkeypatch.setattr(
+        "claude_code_tools.msg.hooks._current_tmux_scope",
+        lambda: ("main", "/tmp/tmux", "%2"),
+    )
+    monkeypatch.setattr(
+        "claude_code_tools.msg.hooks.resolve_pane_agent",
+        lambda _pane, _socket: AmuxAgent(
+            pane="main:1.0", session="main", kind="codex",
+            pid=202, cwd="/repo", extra={"pane_id": "%2"},
+        ),
+    )
+    monkeypatch.setattr(
+        "claude_code_tools.msg.hooks.process_start_identity",
+        lambda _pid: "linux:202:2",
+    )
+    monkeypatch.setattr(
+        "claude_code_tools.msg.hooks._current_window_name",
+        lambda _socket, _pane: "example-exec-docs_01",
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        cli, ["session-start"], input=json.dumps({"session_id": "019d-host"}),
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {}
+    attestation = load_host_session_attestation(
+        db_path, "main", "/tmp/tmux", "%2",
+    )
+    assert attestation["host_session_id"] == "019d-host"
+    assert attestation["host_session_title"] == "example-exec-docs_01"
+    assert attestation["process_start_identity"] == "linux:202:2"
+    assert attestation["code_sha256"] == hashlib.sha256(
+        Path(hooks_module.__file__).read_bytes(),
+    ).hexdigest()
+
+
+@pytest.mark.parametrize("host_session_id", ("", "bad\nvalue", "x" * 257))
+def test_session_start_rejects_invalid_host_session_id_without_marker(
+    monkeypatch, tmp_path, host_session_id,
+):
+    db_path = tmp_path / "msg.db"
+    monkeypatch.setattr(hooks_module, "DEFAULT_DB_PATH", str(db_path))
+    monkeypatch.setattr(
+        hooks_module, "_current_tmux_scope",
+        lambda: ("main", "/tmp/tmux", "%2"),
+    )
+
+    result = CliRunner().invoke(
+        cli, ["session-start"], input=json.dumps({"session_id": host_session_id}),
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {}
+    assert load_host_session_attestation(
+        db_path, "main", "/tmp/tmux", "%2",
+    ) is None
+
+
+def test_claude_bootstrap_prompt_sets_native_session_title(monkeypatch, tmp_path):
+    db_path = tmp_path / "msg.db"
+    store = MsgStore(db_path)
+    monkeypatch.setattr(hooks_module, "DEFAULT_DB_PATH", str(db_path))
+    monkeypatch.setattr(
+        hooks_module, "_current_tmux_scope",
+        lambda: ("main", "/tmp/tmux", "%2"),
+    )
+    monkeypatch.setattr(hooks_module, "MsgStore", lambda: store)
+    write_host_session_attestation(
+        db_path,
+        tmux_session="main",
+        tmux_socket="/tmp/tmux",
+        pane_id="%2",
+        agent_kind=AgentKind.CLAUDE,
+        pid=202,
+        process_start_identity="linux:202:2",
+        cwd="/repo",
+        host_session_id="claude-host",
+        host_session_title="example-exec-docs_01",
+        code_sha256=hooks_module.hook_module_sha256(),
+    )
+
+    result = CliRunner().invoke(
+        cli, ["prompt-submit"], input=json.dumps({"session_id": "claude-host"}),
+    )
+
+    output = json.loads(result.output)
+    assert output["hookSpecificOutput"] == {
+        "hookEventName": "UserPromptSubmit",
+        "sessionTitle": "example-exec-docs_01",
+    }
+
+
+def test_codex_title_adapter_sets_and_reads_back_exact_name(monkeypatch):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Result", (), {
+            "returncode": 0,
+            "stdout": "\n".join((
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}),
+                json.dumps({
+                    "jsonrpc": "2.0", "id": 2,
+                    "result": {"thread": {"name": "example-exec-docs_01"}},
+                }),
+            )),
+            "stderr": "",
+        })()
+
+    monkeypatch.setattr(hooks_module.subprocess, "run", run)
+
+    assert hooks_module._set_codex_session_title(
+        "019d-thread", "example-exec-docs_01",
+    )
+    requests = [json.loads(line) for line in calls[0][1]["input"].splitlines()]
+    assert [request["method"] for request in requests] == [
+        "thread/name/set", "thread/read",
+    ]
+    assert requests[0]["params"] == {
+        "threadId": "019d-thread", "name": "example-exec-docs_01",
+    }
+
+
+def test_codex_bootstrap_prompt_sets_native_session_title(monkeypatch, tmp_path):
+    db_path = tmp_path / "msg.db"
+    store = MsgStore(db_path)
+    monkeypatch.setattr(hooks_module, "DEFAULT_DB_PATH", str(db_path))
+    monkeypatch.setattr(
+        hooks_module, "_current_tmux_scope",
+        lambda: ("main", "/tmp/tmux", "%2"),
+    )
+    monkeypatch.setattr(hooks_module, "MsgStore", lambda: store)
+    calls = []
+    monkeypatch.setattr(
+        hooks_module, "_set_codex_session_title",
+        lambda session_id, title: calls.append((session_id, title)) or True,
+        raising=False,
+    )
+    write_host_session_attestation(
+        db_path,
+        tmux_session="main",
+        tmux_socket="/tmp/tmux",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=202,
+        process_start_identity="linux:202:2",
+        cwd="/repo",
+        host_session_id="codex-host",
+        host_session_title="example-exec-docs_01",
+        code_sha256=hooks_module.hook_module_sha256(),
+    )
+
+    result = CliRunner().invoke(
+        cli, ["prompt-submit"], input=json.dumps({"session_id": "codex-host"}),
+    )
+
+    assert json.loads(result.output) == {}
+    assert calls == [("codex-host", "example-exec-docs_01")]
 
     def test_codex_no_messages_emits_valid_empty_stop_json(self, store):
         codex = store.register_agent(

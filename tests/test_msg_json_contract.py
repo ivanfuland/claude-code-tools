@@ -59,6 +59,8 @@ def test_agent_payload_is_complete_and_json_compatible():
         "last_seen": "2026-01-01T00:00:01+00:00",
         "consumer_protocol": "first-mate.v1",
         "process_start_identity": "linux:4242:100",
+        "host_session_id": None,
+        "host_session_title": None,
     }
     json.dumps(payload)
 

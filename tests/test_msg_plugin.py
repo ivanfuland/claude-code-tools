@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import subprocess
 import sys
+import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import claude_code_tools
 from claude_code_tools.amux.scan import resolve_pane_agent
 from claude_code_tools.msg.models import (
     AgentKind,
@@ -50,20 +52,38 @@ def test_paired_manifests_share_version_and_codex_hook_path():
     claude = load_json(PLUGIN / ".claude-plugin/plugin.json")
     codex = load_json(PLUGIN / ".codex-plugin/plugin.json")
 
-    assert claude["version"] == codex["version"] == "1.15.1"
+    assert claude["version"] == codex["version"] == "1.15.2"
     assert codex["hooks"] == "./hooks/hooks.json"
     assert "Native lifecycle hooks" in codex["interface"]["capabilities"]
+
+
+def test_distribution_version_matches_host_session_release():
+    project = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+    )["project"]
+    assert project["version"] == claude_code_tools.__version__ == "1.25.7"
+
+
+def test_paired_hook_manifest_registers_session_start():
+    hooks = load_json(PLUGIN / "hooks/hooks.json")["hooks"]
+
+    assert hooks["SessionStart"][0]["hooks"][0]["command"] == (
+        "msg-hook session-start"
+    )
 
 
 def test_plugin_hook_file_uses_installed_entrypoint_for_all_native_events():
     hooks = load_json(PLUGIN / "hooks/hooks.json")["hooks"]
 
-    assert set(hooks) == {"PostToolUse", "Stop", "UserPromptSubmit"}
+    assert set(hooks) == {
+        "SessionStart", "PostToolUse", "Stop", "UserPromptSubmit",
+    }
     for event, groups in hooks.items():
         assert len(groups) == 1
         command = groups[0]["hooks"][0]["command"]
         assert command.startswith("msg-hook ")
         assert {
+            "SessionStart": "session-start",
             "PostToolUse": "post-tool-use",
             "Stop": "stop",
             "UserPromptSubmit": "prompt-submit",
@@ -105,9 +125,9 @@ def test_release_evidence_binds_cli_contract_plugin_version_and_tree_hash():
 
     assert evidence["schema"] == "msg.plugin.release.v1"
     assert evidence["cli_contract_schema"] == "msg.cli.v1"
-    assert evidence["cli_release_base"] == "1.25.6"
+    assert evidence["cli_release_base"] == "1.25.7"
     assert evidence["cli_release_status"] == "unreleased"
-    assert evidence["plugin_version"] == "1.15.1"
+    assert evidence["plugin_version"] == "1.15.2"
     assert evidence["plugin_payload_sha256"] == plugin_payload_sha256()
     assert evidence["claude_manifest_sha256"] == hashlib.sha256(
         claude.read_bytes()

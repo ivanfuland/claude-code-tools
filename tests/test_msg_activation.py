@@ -6,6 +6,7 @@ import stat
 import threading
 import time
 
+from claude_code_tools.msg import activation as activation_module
 from claude_code_tools.msg.activation import (
     load_activation,
     remove_activation,
@@ -40,6 +41,93 @@ def test_activation_marker_is_atomic_private_and_scope_bound(tmp_path):
         store.db_path, agent, expected_generation=receipt.generation,
     )
     assert load_activation(store.db_path, "main", "/tmp/tmux", "%2") is None
+
+
+def test_host_session_attestation_is_private_and_scope_bound(tmp_path):
+    receipt = activation_module.write_host_session_attestation(
+        tmp_path / "msg.db",
+        tmux_session="main",
+        tmux_socket="/tmp/tmux",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=202,
+        process_start_identity="linux:202:2",
+        cwd="/repo",
+        host_session_id="019d-host-session",
+        host_session_title="example-exec-docs_01",
+        code_sha256="a" * 64,
+    )
+
+    assert stat.S_IMODE(receipt.path.stat().st_mode) == 0o600
+    loaded = activation_module.load_host_session_attestation(
+        tmp_path / "msg.db", "main", "/tmp/tmux", "%2",
+    )
+    assert loaded["schema"] == "msg.host-session-attestation.v1"
+    assert loaded["host_session_id"] == "019d-host-session"
+    assert loaded["host_session_title"] == "example-exec-docs_01"
+    assert activation_module.load_host_session_attestation(
+        tmp_path / "msg.db", "main", "/tmp/other", "%2",
+    ) is None
+
+
+def test_host_session_attestation_completes_short_writes(monkeypatch, tmp_path):
+    real_write = activation_module.os.write
+    writes = 0
+
+    def short_write(fd, data):
+        nonlocal writes
+        writes += 1
+        chunk = bytes(data[:max(1, len(data) // 2)])
+        return real_write(fd, chunk)
+
+    monkeypatch.setattr(activation_module.os, "write", short_write)
+    activation_module.write_host_session_attestation(
+        tmp_path / "msg.db",
+        tmux_session="main",
+        tmux_socket="/tmp/tmux",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=202,
+        process_start_identity="linux:202:2",
+        cwd="/repo",
+        host_session_id="019d-host-session",
+        host_session_title="example-exec-docs_01",
+        code_sha256="a" * 64,
+    )
+
+    loaded = activation_module.load_host_session_attestation(
+        tmp_path / "msg.db", "main", "/tmp/tmux", "%2",
+    )
+    assert writes > 1
+    assert loaded["host_session_id"] == "019d-host-session"
+
+
+def test_host_session_attestation_symlink_fails_closed(tmp_path):
+    receipt = activation_module.write_host_session_attestation(
+        tmp_path / "msg.db",
+        tmux_session="main",
+        tmux_socket="/tmp/tmux",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=202,
+        process_start_identity="linux:202:2",
+        cwd="/repo",
+        host_session_id="019d-host-session",
+        host_session_title="example-exec-docs_01",
+        code_sha256="a" * 64,
+    )
+    target = tmp_path / "untrusted.json"
+    target.write_text("{}", encoding="utf-8")
+    receipt.path.unlink()
+    receipt.path.symlink_to(target)
+
+    loaded = activation_module.load_host_session_attestation(
+        tmp_path / "msg.db", "main", "/tmp/tmux", "%2",
+    )
+    assert loaded == {
+        "schema": "msg.host-session-attestation.v1",
+        "invalid": True,
+    }
 
 
 def test_loser_cleanup_cannot_delete_winner_marker(tmp_path):
