@@ -3,7 +3,7 @@
   "cli_distribution": "claude-code-tools",
   "cli_release_base": "1.25.7",
   "cli_release_status": "unreleased",
-  "cli_source_commit": "823d8b06d18b4d348747adfe10fe58c09fe38583",
+  "cli_source_commit": "f73548884806d1aaa0139ea7675ceb3f1d50997d",
   "cli_wheel_sha256": "3bf7bd7b21536af85d7936a80c9398324ee64c44130dae59a3a22687ae029626",
   "cli_contract_schema": "msg.cli.v1",
   "db_schema_version": 5,
