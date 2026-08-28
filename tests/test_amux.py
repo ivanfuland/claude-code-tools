@@ -374,6 +374,37 @@ class TestScanWithStubbedTmux:
         assert agent.extra == {"pane_id": "%7"}
         assert calls[0][0] == "/tmp/tmux-main"
 
+    def test_resolve_ignores_msg_hook_under_claude_code_tools_path(
+        self, monkeypatch,
+    ) -> None:
+        from claude_code_tools.amux import scan as scan_mod
+
+        monkeypatch.setattr(
+            scan_mod,
+            "_tmux_target",
+            lambda *_args: self.SEP.join(
+                ("%7", "main", "700", "/repo", "main:3.7")
+            ),
+        )
+        monkeypatch.setattr(
+            scan_mod,
+            "_children_by_ppid",
+            lambda: {
+                700: [(701, "node /opt/@openai/codex/bin/codex.js")],
+                701: [(777, "/opt/codex --yolo")],
+                777: [(
+                    778,
+                    "python /repo/claude-code-tools/.venv/bin/msg-hook "
+                    "session-start",
+                )],
+            },
+        )
+
+        agent = scan_mod.resolve_pane_agent("%7", "/tmp/tmux-main")
+
+        assert agent is not None
+        assert (agent.kind, agent.pid) == ("codex", 701)
+
     def test_resolve_pane_agent_fails_closed_without_one_harness(self, monkeypatch) -> None:
         from claude_code_tools.amux import scan as scan_mod
 
@@ -895,12 +926,21 @@ class TestExecutableOnlyMatching:
     def test_agent_name_in_arguments_is_not_an_agent(self, cmd: str) -> None:
         assert detect.classify_argv(cmd) is None
 
+    def test_parent_directory_name_is_not_a_claude_launcher(self) -> None:
+        command = (
+            "python /repo/claude-code-tools/.venv/bin/msg-hook session-start"
+        )
+
+        assert detect.classify_argv(command) is None
+
     @pytest.mark.parametrize(
         "cmd,kind",
         [
             ("claude --resume x", "claude"),
             ("/usr/local/bin/codex --yolo", "codex"),
             ("node /p/node_modules/@openai/codex/bin/codex.js --yolo", "codex"),
+            ("python /opt/claude.js --resume y", "claude"),
+            ("python /opt/claude-code --resume y", "claude"),
             ("/Users/p/.local/share/claude/versions/2.1.220 --resume y", "claude"),
         ],
     )

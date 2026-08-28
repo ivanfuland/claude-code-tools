@@ -108,6 +108,14 @@ Registrations are explicit, and retiring one never deletes history.
   Reusing a retired candidate generation or retargeting a drifted title fails
   without moving the stable registration.
 
+  A successful replace-candidate also republishes the attestation with the
+  stable logical title while preserving the resumed host session ID. This is
+  the recoverable rename-gap boundary: the lifecycle layer then renames the
+  tmux window and native session. Claude Code uses its supported `/rename`
+  lifecycle command for an already-named resumed session; Codex reapplies the
+  stable title from its Stop hook through a short-lived official app-server
+  stdio client, after Codex's own automatic title generation has finished.
+
 Names are reusable after retirement, and historical messages keep the sender
 name they were sent under rather than being rewritten.
 
@@ -146,6 +154,11 @@ session and expose only bounded state. After an exact continuation clear,
 `pending=0 + idle` allows Stop repeatedly, so a parked Agent does not create
 new turns by itself. A stale heartbeat requests recovery; expiry never clears
 the responsibility and never classifies an Agent as parked or dead.
+
+The amux process classifier ignores helper processes whose parent directory
+happens to contain `claude-code-tools`; only an actual Claude launcher path is
+classified as Claude. This prevents a Codex `msg-hook` child from making one
+pane appear to contain both Harnesses during SessionStart.
 
 The durable consumer sequence is:
 

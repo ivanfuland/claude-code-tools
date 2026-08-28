@@ -24,6 +24,7 @@ from .activation import (
     load_host_session_attestation,
     remove_activation,
     write_activation,
+    write_host_session_attestation,
 )
 from .hooks import hook_module_sha256
 from .json_contract import (
@@ -875,13 +876,22 @@ def retarget(
             store.db_path, tmux_session, tmux_socket, pane,
         )
         window_name = _window_name_for_pane(tmux_socket, pane)
-        expected = (
+        candidate_expected = (
             candidate.agent_kind.value,
             candidate.pid,
             candidate.process_start_identity,
             candidate.cwd,
             candidate.host_session_id,
             candidate.host_session_title,
+            hook_module_sha256(),
+        )
+        stable_expected = (
+            previous.agent_kind.value,
+            previous.pid,
+            previous.process_start_identity,
+            previous.cwd,
+            previous.host_session_id,
+            previous.host_session_title,
             hook_module_sha256(),
         )
         actual = (
@@ -893,10 +903,34 @@ def retarget(
             attestation.get("host_session_title") if attestation else None,
             attestation.get("code_sha256") if attestation else None,
         )
+        candidate_active = candidate.session_id in {
+            item.session_id
+            for item in store.list_agents(tmux_session, tmux_socket)
+        }
+        already_retargeted = (
+            previous.pane_id == pane
+            and previous.tmux_session == tmux_session
+            and previous.tmux_socket == tmux_socket
+            and previous.agent_kind is AgentKind(target.kind)
+            and previous.pid == target.pid
+            and previous.process_start_identity == start_identity
+            and previous.cwd == target.cwd
+        )
+        identity_matches = (
+            actual == candidate_expected
+            if candidate_active
+            else already_retargeted
+            and actual in {candidate_expected, stable_expected}
+        )
+        window_matches = (
+            window_name == candidate.name
+            if candidate_active
+            else window_name in {candidate.name, previous.name}
+        )
         if (
             candidate.consumer_protocol is not ConsumerProtocol.FIRST_MATE_V1
-            or actual != expected
-            or window_name != candidate.name
+            or not identity_matches
+            or not window_matches
             or candidate.host_session_title != candidate.name
         ):
             raise click.ClickException(
@@ -944,6 +978,28 @@ def retarget(
                 expected_generation=previous_generation,
             )
     if agent.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1:
+        if (
+            agent.pid is None
+            or not agent.process_start_identity
+            or not agent.cwd
+            or not agent.host_session_id
+        ):
+            raise click.ClickException(
+                "retargeted first-mate host session identity is incomplete"
+            )
+        write_host_session_attestation(
+            store.db_path,
+            tmux_session=agent.tmux_session,
+            tmux_socket=agent.tmux_socket,
+            pane_id=agent.pane_id,
+            agent_kind=agent.agent_kind,
+            pid=agent.pid,
+            process_start_identity=agent.process_start_identity,
+            cwd=agent.cwd,
+            host_session_id=agent.host_session_id,
+            host_session_title=agent.name,
+            code_sha256=hook_module_sha256(),
+        )
         write_activation(store.db_path, agent)
     elif candidate and candidate_generation:
         remove_activation(

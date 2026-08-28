@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -261,38 +262,65 @@ def test_claude_bootstrap_prompt_sets_native_session_title(monkeypatch, tmp_path
     }
 
 
-def test_codex_title_adapter_sets_and_reads_back_exact_name(monkeypatch):
-    calls = []
+def test_codex_title_adapter_sets_and_reads_back_exact_name(
+    monkeypatch, tmp_path,
+):
+    server = tmp_path / "fake_app_server.py"
+    request_log = tmp_path / "requests.json"
+    server.write_text(
+        """\
+import json
+import os
+import sys
 
-    def run(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return type("Result", (), {
-            "returncode": 0,
-            "stdout": "\n".join((
-                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}),
-                json.dumps({
-                    "jsonrpc": "2.0", "id": 2,
-                    "result": {"thread": {"name": "example-exec-docs_01"}},
-                }),
-            )),
-            "stderr": "",
-        })()
+requests = []
+def read_request():
+    value = json.loads(sys.stdin.readline())
+    requests.append(value)
+    return value
 
-    monkeypatch.setattr(hooks_module.subprocess, "run", run)
+initialize = read_request()
+print(json.dumps({"id": initialize["id"], "result": {}}), flush=True)
+initialized = read_request()
+rename = read_request()
+print(json.dumps({"id": rename["id"], "result": {}}), flush=True)
+readback = read_request()
+with open(os.environ["FAKE_CODEX_REQUEST_LOG"], "w", encoding="utf-8") as handle:
+    json.dump(requests, handle)
+print(json.dumps({
+    "id": readback["id"],
+    "result": {"thread": {"name": os.environ.get(
+        "FAKE_CODEX_READBACK", rename["params"]["name"],
+    )}},
+}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FAKE_CODEX_REQUEST_LOG", str(request_log))
+    monkeypatch.setattr(
+        hooks_module,
+        "_CODEX_APP_SERVER_COMMAND",
+        (sys.executable, str(server)),
+        raising=False,
+    )
 
     assert hooks_module._set_codex_session_title(
         "019d-thread", "example-exec-docs_01",
     )
-    requests = [json.loads(line) for line in calls[0][1]["input"].splitlines()]
+    requests = json.loads(request_log.read_text(encoding="utf-8"))
     assert [request["method"] for request in requests] == [
-        "thread/name/set", "thread/read",
+        "initialize", "initialized", "thread/name/set", "thread/read",
     ]
-    assert requests[0]["params"] == {
+    assert requests[2]["params"] == {
         "threadId": "019d-thread", "name": "example-exec-docs_01",
     }
+    monkeypatch.setenv("FAKE_CODEX_READBACK", "mismatched-title")
+    assert not hooks_module._set_codex_session_title(
+        "019d-thread", "example-exec-docs_01",
+    )
 
 
-def test_codex_bootstrap_prompt_sets_native_session_title(monkeypatch, tmp_path):
+def test_codex_bootstrap_stop_sets_native_session_title(monkeypatch, tmp_path):
     db_path = tmp_path / "msg.db"
     store = MsgStore(db_path)
     monkeypatch.setattr(hooks_module, "DEFAULT_DB_PATH", str(db_path))
@@ -321,10 +349,14 @@ def test_codex_bootstrap_prompt_sets_native_session_title(monkeypatch, tmp_path)
         code_sha256=hooks_module.hook_module_sha256(),
     )
 
-    result = CliRunner().invoke(
+    prompt = CliRunner().invoke(
         cli, ["prompt-submit"], input=json.dumps({"session_id": "codex-host"}),
     )
+    result = CliRunner().invoke(
+        cli, ["stop"], input=json.dumps({"session_id": "codex-host"}),
+    )
 
+    assert prompt.output == ""
     assert json.loads(result.output) == {}
     assert calls == [("codex-host", "example-exec-docs_01")]
 

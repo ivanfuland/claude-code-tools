@@ -12,6 +12,7 @@ from click.testing import CliRunner
 from claude_code_tools.amux.model import Agent as AmuxAgent
 from claude_code_tools.msg.activation import (
     load_activation,
+    load_host_session_attestation,
     write_activation,
     write_host_session_attestation,
 )
@@ -357,16 +358,13 @@ def test_retarget_json_replaces_exact_candidate_and_refreshes_identity(
         lambda _socket, _pane: "example-exec-control_01-candidate-a1",
     )
 
-    payload = machine_payload(
-        CliRunner().invoke(
-            cli,
-            [
-                "retarget", "--session-id", stable.session_id,
-                "--pane", "%2", "--replace-candidate", candidate.session_id,
-                "--json",
-            ],
-        )
-    )
+    argv = [
+        "retarget", "--session-id", stable.session_id,
+        "--pane", "%2", "--replace-candidate", candidate.session_id,
+        "--json",
+    ]
+    payload = machine_payload(CliRunner().invoke(cli, argv))
+    retried = machine_payload(CliRunner().invoke(cli, argv))
 
     assert payload["operation"] == "retarget"
     assert payload["data"]["agent"]["session_id"] == stable.session_id
@@ -377,6 +375,7 @@ def test_retarget_json_replaces_exact_candidate_and_refreshes_identity(
         "current_id": "host-candidate",
         "current_title": "example-exec-control_01",
     }
+    assert retried["data"]["agent"] == payload["data"]["agent"]
     assert [item.session_id for item in store.list_agents("main")] == [
         stable.session_id,
     ]
@@ -387,6 +386,11 @@ def test_retarget_json_replaces_exact_candidate_and_refreshes_identity(
         store.db_path, "main", "/tmp/tmux-main", "%2",
     )
     assert marker["session_id"] == stable.session_id
+    host = load_host_session_attestation(
+        store.db_path, "main", "/tmp/tmux-main", "%2",
+    )
+    assert host["host_session_id"] == "host-candidate"
+    assert host["host_session_title"] == "example-exec-control_01"
 
 
 def test_retarget_first_mate_rejects_candidate_window_drift(

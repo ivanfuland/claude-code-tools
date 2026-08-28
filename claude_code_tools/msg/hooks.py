@@ -13,12 +13,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import selectors
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import click
 
+from claude_code_tools import __version__ as CCTOOLS_VERSION
 from claude_code_tools.amux.scan import resolve_pane_agent
 from claude_code_tools.process_identity import process_start_identity
 
@@ -40,6 +43,9 @@ from .store import DEFAULT_DB_PATH, MsgStore
 _LOADED_HOOK_MODULE_SHA256 = hashlib.sha256(
     Path(__file__).read_bytes(),
 ).hexdigest()
+_CODEX_APP_SERVER_COMMAND = (
+    "codex", "app-server", "--listen", "stdio://",
+)
 
 
 def hook_module_sha256() -> str:
@@ -60,7 +66,7 @@ def _current_tmux_scope() -> tuple[str, str | None, str] | None:
         cmd += ["display-message", "-t", pane_id, "-p", "#{session_name}"]
         result = subprocess.run(
             cmd,
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
         tmux_session = result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -135,50 +141,112 @@ def _attest_host_session(hook_input: object) -> None:
 
 
 def _set_codex_session_title(host_session_id: str, title: str) -> bool:
-    requests = "\n".join((
-        json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "thread/name/set",
-            "params": {"threadId": host_session_id, "name": title},
-        }),
-        json.dumps({
-            "jsonrpc": "2.0", "id": 2, "method": "thread/read",
-            "params": {"threadId": host_session_id, "includeTurns": False},
-        }),
-    )) + "\n"
+    process = None
+    selector = None
+    readback = None
     try:
-        result = subprocess.run(
-            ["codex", "app-server", "proxy"],
-            input=requests,
-            capture_output=True,
+        process = subprocess.Popen(
+            _CODEX_APP_SERVER_COMMAND,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
-            check=False,
+            encoding="utf-8",
+            bufsize=1,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            return False
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        deadline = time.monotonic() + 4.0
+
+        def write_message(value: dict) -> None:
+            process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+
+        def read_response(request_id: int) -> dict | None:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    return None
+                remaining = max(0.0, deadline - time.monotonic())
+                for key, _mask in selector.select(timeout=remaining):
+                    line = key.fileobj.readline()
+                    if not line or key.data != "stdout":
+                        continue
+                    try:
+                        response = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        isinstance(response, dict)
+                        and response.get("id") == request_id
+                    ):
+                        return response
+            return None
+
+        write_message({
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "msg-hook",
+                    "title": "msg First-mate Hook",
+                    "version": CCTOOLS_VERSION,
+                },
+            },
+        })
+        initialized = read_response(0)
+        if not initialized or "error" in initialized:
+            return False
+        write_message({"method": "initialized"})
+        write_message({
+            "id": 1,
+            "method": "thread/name/set",
+            "params": {"threadId": host_session_id, "name": title},
+        })
+        renamed = read_response(1)
+        if not renamed or "error" in renamed:
+            return False
+        write_message({
+            "id": 2,
+            "method": "thread/read",
+            "params": {"threadId": host_session_id, "includeTurns": False},
+        })
+        readback = read_response(2)
+    except (OSError, subprocess.SubprocessError, ValueError):
         return False
-    if result.returncode != 0 or result.stderr:
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                    process.wait(timeout=1)
+                except OSError:
+                    pass
+    if not readback or "error" in readback:
         return False
-    responses = []
-    for line in result.stdout.splitlines():
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict) and value.get("id") in {1, 2}:
-            responses.append(value)
-    if len(responses) != 2 or any("error" in value for value in responses):
-        return False
-    readback = next(value for value in responses if value.get("id") == 2)
-    return (
-        ((readback.get("result") or {}).get("thread") or {}).get("name")
-        == title
-    )
+    return ((readback.get("result") or {}).get("thread") or {}).get("name") == title
 
 
 def _bootstrap_title_response(
     hook_event: str, scope: tuple[str, str | None, str] | None,
 ) -> dict | None:
-    if hook_event != "UserPromptSubmit" or scope is None:
+    if hook_event not in {"UserPromptSubmit", "Stop"} or scope is None:
         return None
     tmux_session, tmux_socket, pane_id = scope
     attestation = load_host_session_attestation(
@@ -197,6 +265,8 @@ def _bootstrap_title_response(
         return None
     kind = attestation.get("agent_kind")
     if kind == AgentKind.CLAUDE.value:
+        if hook_event != "UserPromptSubmit":
+            return None
         return {
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
@@ -204,6 +274,8 @@ def _bootstrap_title_response(
             }
         }
     if kind == AgentKind.CODEX.value:
+        if hook_event != "Stop":
+            return None
         if not _set_codex_session_title(host_session_id, title):
             raise ValueError("Codex session title readback failed")
         return {}

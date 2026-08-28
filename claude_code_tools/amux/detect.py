@@ -24,7 +24,9 @@ _INTERPRETERS = {"node", "node.exe", "python", "python3", "bun", "deno"}
 
 #: Script-path fragments that identify a harness when run under an interpreter.
 _CODEX_PATH = re.compile(r"@openai/codex|/codex(\.js|-cli)?\b")
-_CLAUDE_PATH = re.compile(r"/claude(\.js|-code)?\b|/\.local/share/claude/")
+_CLAUDE_PATH = re.compile(
+    r"/claude(?:\.js|-code)?(?:/|$)|/\.local/share/claude/"
+)
 
 
 def _basename(token: str) -> str:
