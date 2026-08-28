@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,15 +16,42 @@ class AgentKind(str, Enum):
     CODEX = "codex"
 
 
-class ConsumerProtocol(str, Enum):
-    """How a registered agent consumes delivery notifications."""
+class DeliveryMode(str, Enum):
+    """How msg delivers notifications for one registered endpoint."""
 
-    LEGACY = "legacy"
-    FIRST_MATE_V1 = "first-mate.v1"
+    PUSH = "push"
+    PULL = "pull"
+
+
+_PROTOCOL_ID = re.compile(r"^[a-z][a-z0-9.-]{0,63}$")
+
+
+def validate_consumer_protocol(value: str) -> str:
+    """Validate and return one opaque upper-layer protocol label."""
+    if not isinstance(value, str) or _PROTOCOL_ID.fullmatch(value) is None:
+        raise ValueError("consumer protocol is invalid")
+    return value
+
+
+def validate_host_session_id(value: str | None) -> str | None:
+    """Validate and return one optional opaque host session identifier."""
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 256
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ValueError("host session id is invalid")
+    return value
 
 
 class ContinuationState(str, Enum):
-    """Whether an agent owns an armed First-mate responsibility."""
+    """Whether a pull consumer has a current wake lease."""
 
     IDLE = "idle"
     ACTIVE_FRESH = "active_fresh"
@@ -70,10 +98,10 @@ class Agent:
     cwd: str | None = None
     registered_at: str = field(default_factory=_now_iso)
     last_seen: str = field(default_factory=_now_iso)
-    consumer_protocol: ConsumerProtocol = ConsumerProtocol.LEGACY
+    consumer_protocol: str = "legacy"
+    delivery_mode: DeliveryMode = DeliveryMode.PUSH
     process_start_identity: str | None = None
     host_session_id: str | None = None
-    host_session_title: str | None = None
 
 
 @dataclass(frozen=True)

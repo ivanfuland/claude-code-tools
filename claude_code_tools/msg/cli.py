@@ -20,13 +20,10 @@ from claude_code_tools.process_identity import process_start_identity
 from . import maintenance as maintenance_mode
 from .activation import (
     activation_generation,
-    is_first_mate_session_title,
     load_host_session_attestation,
     remove_activation,
     write_activation,
-    write_host_session_attestation,
 )
-from .hooks import hook_module_sha256
 from .json_contract import (
     SCHEMA,
     agent_payload,
@@ -36,7 +33,13 @@ from .json_contract import (
     watcher_payload,
 )
 from .migrations import CURRENT_SCHEMA_VERSION
-from .models import Agent, AgentKind, ConsumerProtocol, RegistrationIdentity
+from .models import (
+    Agent,
+    AgentKind,
+    DeliveryMode,
+    RegistrationIdentity,
+    validate_consumer_protocol,
+)
 from .store import (
     DEFAULT_DB_DIR,
     DEFAULT_DB_PATH,
@@ -48,23 +51,6 @@ from .store import (
 from .watcher import distribution_version, watcher_module_sha256
 
 MAX_MACHINE_OUTPUT_BYTES = 1024 * 1024
-
-
-def _window_name_for_pane(
-    tmux_socket: str | None, pane_id: str,
-) -> str | None:
-    cmd = ["tmux"]
-    if tmux_socket:
-        cmd += ["-S", tmux_socket]
-    cmd += ["display-message", "-t", pane_id, "-p", "#{window_name}"]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    value = result.stdout.rstrip("\n")
-    return value or None
 
 
 def _operation_from_argv(argv: list[str]) -> str:
@@ -625,6 +611,15 @@ def maintenance_exit(
         click.echo("Maintenance mode exited.")
 
 
+def _consumer_protocol_option(
+    _ctx: click.Context, _param: click.Parameter, value: str,
+) -> str:
+    try:
+        return validate_consumer_protocol(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+
 @cli.command()
 @click.argument("name")
 @click.option(
@@ -638,8 +633,13 @@ def maintenance_exit(
 )
 @click.option(
     "--consumer-protocol",
-    default=ConsumerProtocol.LEGACY.value,
-    type=click.Choice([protocol.value for protocol in ConsumerProtocol]),
+    default="legacy",
+    callback=_consumer_protocol_option,
+)
+@click.option(
+    "--delivery-mode",
+    default=DeliveryMode.PUSH.value,
+    type=click.Choice([mode.value for mode in DeliveryMode]),
 )
 @json_option
 @click.pass_context
@@ -649,6 +649,7 @@ def register(
     pane: str | None,
     agent: str | None,
     consumer_protocol: str,
+    delivery_mode: str,
     json_output: bool,
 ) -> None:
     """Register this session as a named agent."""
@@ -683,41 +684,31 @@ def register(
             f"cannot prove process-start identity for pane {pane_id}"
         )
     display_addr = target.pane
-    requested_protocol = ConsumerProtocol(consumer_protocol)
+    requested_protocol = consumer_protocol
+    requested_mode = DeliveryMode(delivery_mode)
+    if requested_mode is DeliveryMode.PULL and not requested_protocol:
+        raise click.ClickException("pull registration requires a protocol label")
     host_session_id = None
-    host_session_title = None
-    if requested_protocol is ConsumerProtocol.FIRST_MATE_V1:
-        if not is_first_mate_session_title(name):
-            raise click.ClickException("invalid first-mate logical session name")
-        attestation = load_host_session_attestation(
-            store.db_path, tmux_session, tmux_socket, pane_id,
-        )
-        window_name = _window_name_for_pane(tmux_socket, pane_id)
+    attestation = load_host_session_attestation(
+        store.db_path, tmux_session, tmux_socket, pane_id,
+    )
+    if attestation:
         expected = (
-            agent_kind.value, target.pid, start_identity, target.cwd, name,
-            hook_module_sha256(),
+            agent_kind.value, target.pid, start_identity, target.cwd,
         )
         actual = (
-            attestation.get("agent_kind") if attestation else None,
-            attestation.get("pid") if attestation else None,
-            attestation.get("process_start_identity") if attestation else None,
-            attestation.get("cwd") if attestation else None,
-            attestation.get("host_session_title") if attestation else None,
-            attestation.get("code_sha256") if attestation else None,
+            attestation.get("agent_kind"),
+            attestation.get("pid"),
+            attestation.get("process_start_identity"),
+            attestation.get("cwd"),
         )
-        host_session_id = (
-            attestation.get("host_session_id") if attestation else None
-        )
-        if (
-            actual != expected
-            or window_name != name
-            or not isinstance(host_session_id, str)
-            or not host_session_id
-        ):
+        if attestation.get("invalid") or actual != expected:
             raise click.ClickException(
-                "first-mate host session attestation does not match target"
+                "host session attestation does not match target"
             )
-        host_session_title = name
+        host_session_id = attestation.get("host_session_id")
+        if not isinstance(host_session_id, str) or not host_session_id:
+            raise click.ClickException("host session attestation is incomplete")
     existing_agent = store.get_agent_by_name(name, tmux_session, tmux_socket)
     existing_generation = (
         activation_generation(store.db_path, existing_agent)
@@ -725,7 +716,7 @@ def register(
     )
     provisional = None
     provisional_receipt = None
-    if requested_protocol is ConsumerProtocol.FIRST_MATE_V1:
+    if requested_mode is DeliveryMode.PULL:
         provisional = Agent(
             session_id=f"provisional:{uuid.uuid4()}",
             name=name,
@@ -737,9 +728,9 @@ def register(
             pid=target.pid,
             cwd=target.cwd,
             consumer_protocol=requested_protocol,
+            delivery_mode=requested_mode,
             process_start_identity=start_identity,
             host_session_id=host_session_id,
-            host_session_title=host_session_title,
         )
         provisional_receipt = write_activation(store.db_path, provisional)
 
@@ -754,9 +745,9 @@ def register(
             pid=target.pid,
             cwd=target.cwd,
             consumer_protocol=requested_protocol,
+            delivery_mode=requested_mode,
             process_start_identity=start_identity,
             host_session_id=host_session_id,
-            host_session_title=host_session_title,
         )
     except ValueError as exc:
         if (
@@ -770,7 +761,7 @@ def register(
                 expected_generation=provisional_receipt.generation,
             )
         raise click.ClickException(str(exc)) from exc
-    if result.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1:
+    if result.delivery_mode is DeliveryMode.PULL:
         write_activation(store.db_path, result)
     else:
         if existing_generation:
@@ -830,28 +821,46 @@ def unregister(ctx: click.Context, name: str | None, session_id: str | None) -> 
 @cli.command()
 @click.option("--session-id", required=True, help="Exact active registration to move.")
 @click.option("--pane", required=True, help="Destination tmux pane ID.")
-@click.option("--replace-candidate", help="Active target registration to replace.")
+@click.option(
+    "--replace-registration",
+    help="Exact active target registration to replace.",
+)
+@click.option(
+    "--replace-candidate",
+    "deprecated_replacement_alias",
+    hidden=True,
+    help="Deprecated alias for --replace-registration.",
+)
 @json_option
 @click.pass_context
 def retarget(
     ctx: click.Context,
     session_id: str,
     pane: str,
-    replace_candidate: str | None,
+    replace_registration: str | None,
+    deprecated_replacement_alias: str | None,
     json_output: bool,
 ) -> None:
     """Move one exact active registration to another pane."""
+    if replace_registration and deprecated_replacement_alias:
+        raise click.UsageError(
+            "replacement options are mutually exclusive"
+        )
+    replace_registration_id = (
+        replace_registration or deprecated_replacement_alias
+    )
     store: MsgStore = ctx.obj["store"]
     previous = store.get_agent_by_id(session_id)
-    candidate = (
-        store.get_agent_by_id(replace_candidate)
-        if replace_candidate else None
+    replacement_agent = (
+        store.get_agent_by_id(replace_registration_id)
+        if replace_registration_id else None
     )
     previous_generation = (
         activation_generation(store.db_path, previous) if previous else None
     )
-    candidate_generation = (
-        activation_generation(store.db_path, candidate) if candidate else None
+    replacement_generation = (
+        activation_generation(store.db_path, replacement_agent)
+        if replacement_agent else None
     )
     tmux_socket = _detect_tmux_socket(pane)
     target = resolve_pane_agent(pane, tmux_socket)
@@ -865,82 +874,7 @@ def retarget(
         raise click.ClickException(
             f"cannot prove process-start identity for pane {pane}"
         )
-    if (
-        previous
-        and previous.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
-        and replace_candidate
-    ):
-        if candidate is None:
-            raise click.ClickException("replace candidate is not active")
-        attestation = load_host_session_attestation(
-            store.db_path, tmux_session, tmux_socket, pane,
-        )
-        window_name = _window_name_for_pane(tmux_socket, pane)
-        candidate_expected = (
-            candidate.agent_kind.value,
-            candidate.pid,
-            candidate.process_start_identity,
-            candidate.cwd,
-            candidate.host_session_id,
-            candidate.host_session_title,
-            hook_module_sha256(),
-        )
-        stable_expected = (
-            previous.agent_kind.value,
-            previous.pid,
-            previous.process_start_identity,
-            previous.cwd,
-            previous.host_session_id,
-            previous.host_session_title,
-            hook_module_sha256(),
-        )
-        actual = (
-            attestation.get("agent_kind") if attestation else None,
-            attestation.get("pid") if attestation else None,
-            attestation.get("process_start_identity") if attestation else None,
-            attestation.get("cwd") if attestation else None,
-            attestation.get("host_session_id") if attestation else None,
-            attestation.get("host_session_title") if attestation else None,
-            attestation.get("code_sha256") if attestation else None,
-        )
-        candidate_active = candidate.session_id in {
-            item.session_id
-            for item in store.list_agents(tmux_session, tmux_socket)
-        }
-        already_retargeted = (
-            previous.pane_id == pane
-            and previous.tmux_session == tmux_session
-            and previous.tmux_socket == tmux_socket
-            and previous.agent_kind is AgentKind(target.kind)
-            and previous.pid == target.pid
-            and previous.process_start_identity == start_identity
-            and previous.cwd == target.cwd
-        )
-        identity_matches = (
-            actual == candidate_expected
-            if candidate_active
-            else already_retargeted
-            and actual in {candidate_expected, stable_expected}
-        )
-        window_matches = (
-            window_name == candidate.name
-            if candidate_active
-            else window_name in {candidate.name, previous.name}
-        )
-        if (
-            candidate.consumer_protocol is not ConsumerProtocol.FIRST_MATE_V1
-            or not identity_matches
-            or not window_matches
-            or candidate.host_session_title != candidate.name
-        ):
-            raise click.ClickException(
-                "candidate window/title identity does not match target"
-            )
-    projected = None
-    if (
-        previous
-        and previous.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
-    ):
+    if previous and previous.delivery_mode is DeliveryMode.PULL:
         projected = Agent(
             session_id=previous.session_id,
             name=previous.name,
@@ -951,7 +885,8 @@ def retarget(
             agent_kind=AgentKind(target.kind),
             pid=target.pid,
             cwd=target.cwd,
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol=previous.consumer_protocol,
+            delivery_mode=previous.delivery_mode,
             process_start_identity=start_identity,
         )
         write_activation(store.db_path, projected)
@@ -966,61 +901,37 @@ def retarget(
             pid=target.pid,
             cwd=target.cwd,
             process_start_identity=start_identity,
-            replace_candidate_session_id=replace_candidate,
+            replace_registration_id=replace_registration_id,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
-    if previous:
-        if previous_generation:
-            remove_activation(
-                store.db_path,
-                previous,
-                expected_generation=previous_generation,
-            )
-    if agent.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1:
-        if (
-            agent.pid is None
-            or not agent.process_start_identity
-            or not agent.cwd
-            or not agent.host_session_id
-        ):
-            raise click.ClickException(
-                "retargeted first-mate host session identity is incomplete"
-            )
-        write_host_session_attestation(
-            store.db_path,
-            tmux_session=agent.tmux_session,
-            tmux_socket=agent.tmux_socket,
-            pane_id=agent.pane_id,
-            agent_kind=agent.agent_kind,
-            pid=agent.pid,
-            process_start_identity=agent.process_start_identity,
-            cwd=agent.cwd,
-            host_session_id=agent.host_session_id,
-            host_session_title=agent.name,
-            code_sha256=hook_module_sha256(),
-        )
-        write_activation(store.db_path, agent)
-    elif candidate and candidate_generation:
+    if previous and previous_generation:
         remove_activation(
             store.db_path,
-            candidate,
-            expected_generation=candidate_generation,
+            previous,
+            expected_generation=previous_generation,
+        )
+    if agent.delivery_mode is DeliveryMode.PULL:
+        write_activation(store.db_path, agent)
+    elif replacement_agent and replacement_generation:
+        remove_activation(
+            store.db_path,
+            replacement_agent,
+            expected_generation=replacement_generation,
         )
     if json_output:
         emit_json("retarget", {
             "agent": agent_payload(agent),
+            "replacement_registration_id": replace_registration_id,
             "host_session_transition": {
                 "previous_id": previous.host_session_id if previous else None,
-                "previous_title": (
-                    previous.host_session_title if previous else None
-                ),
                 "current_id": agent.host_session_id,
-                "current_title": agent.host_session_title,
             },
         })
     else:
-        click.echo(f"Retargeted '{agent.name}' to {agent.display_addr or agent.pane_id}")
+        click.echo(
+            f"Retargeted '{agent.name}' to {agent.display_addr or agent.pane_id}"
+        )
 
 
 @cli.command("list")
@@ -1375,11 +1286,11 @@ def _bounded_peek_data(messages: list[dict], requested_limit: int) -> dict:
     selected: list[dict] = []
     truncated = False
     for message in messages:
-        candidate = [*selected, message]
+        trial_page = [*selected, message]
         data = {
-            "messages": candidate,
+            "messages": trial_page,
             "requested_limit": requested_limit,
-            "returned": len(candidate),
+            "returned": len(trial_page),
             "truncated_by_output_limit": False,
         }
         envelope = {
@@ -1397,7 +1308,7 @@ def _bounded_peek_data(messages: list[dict], requested_limit: int) -> dict:
                 )
             truncated = True
             break
-        selected = candidate
+        selected = trial_page
     return {
         "messages": selected,
         "requested_limit": requested_limit,

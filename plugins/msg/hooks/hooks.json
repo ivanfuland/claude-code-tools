@@ -1,5 +1,5 @@
 {
-  "description": "Native lifecycle hooks for legacy msg and first-mate.v1 consumers.",
+  "description": "Native lifecycle hooks for push and pull msg consumers.",
   "hooks": {
     "SessionStart": [
       {

@@ -8,10 +8,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import claude_code_tools.msg.models as msg_models
+
 from claude_code_tools.msg.migrations import CURRENT_SCHEMA_VERSION
 from claude_code_tools.msg.models import (
     AgentKind,
-    ConsumerProtocol,
     ContinuationState,
     RegistrationIdentity,
 )
@@ -63,7 +64,8 @@ def register_first_mate(
         "test",
         kind,
         pid=pid,
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=msg_models.DeliveryMode.PULL,
         process_start_identity=process_start_identity,
     )
     return agent, RegistrationIdentity.from_agent(agent)
@@ -85,13 +87,14 @@ class TestAgentRegistration:
             pane_id="%7",
             tmux_session="test",
             agent_kind=AgentKind.CODEX,
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             process_start_identity="linux:4242:100",
         )
 
         loaded = store.get_agent_by_id(agent.session_id)
         assert loaded is not None
-        assert loaded.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
+        assert loaded.consumer_protocol == "first-mate.v1"
         assert loaded.process_start_identity == "linux:4242:100"
 
     def test_register_persists_resumable_host_session_identity(self, store):
@@ -100,16 +103,98 @@ class TestAgentRegistration:
             pane_id="%7",
             tmux_session="test",
             agent_kind=AgentKind.CODEX,
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             process_start_identity="linux:4242:100",
             host_session_id="019d-host-session",
-            host_session_title="example-exec-docs_01",
         )
 
         loaded = store.get_agent_by_id(agent.session_id)
         assert loaded is not None
         assert loaded.host_session_id == "019d-host-session"
-        assert loaded.host_session_title == "example-exec-docs_01"
+        assert not hasattr(loaded, "host_session_title")
+
+    @pytest.mark.parametrize(
+        "host_session_id",
+        ("", "bad\nvalue", "bad\x7fvalue", "界" * 86),
+    )
+    def test_register_rejects_invalid_host_session_id(
+        self, store, host_session_id,
+    ):
+        with pytest.raises(ValueError, match="host session id is invalid"):
+            store.register_agent(
+                name="opaque-host",
+                pane_id="%7",
+                tmux_session="test",
+                agent_kind=AgentKind.CODEX,
+                host_session_id=host_session_id,
+            )
+
+        assert store.list_agents("test") == []
+
+    def test_protocol_label_does_not_select_delivery_mode(self, store):
+        delivery_mode = getattr(msg_models, "DeliveryMode", None)
+        assert delivery_mode is not None
+
+        agent = store.register_agent(
+            name="opaque",
+            pane_id="%8",
+            tmux_session="test",
+            agent_kind=AgentKind.CODEX,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=delivery_mode.PUSH,
+        )
+
+        assert agent.consumer_protocol == "first-mate.v1"
+        assert agent.delivery_mode is delivery_mode.PUSH
+
+    def test_register_rejects_unknown_delivery_mode(self, store):
+        with pytest.raises(ValueError, match="delivery mode is invalid"):
+            store.register_agent(
+                name="opaque",
+                pane_id="%8",
+                tmux_session="test",
+                agent_kind=AgentKind.CODEX,
+                delivery_mode="sideways",
+            )
+
+        assert store.list_agents("test") == []
+
+    @pytest.mark.parametrize(
+        "protocol",
+        ("", "Upper.v1", "bad value", "x" * 65, "bad\x00value"),
+    )
+    def test_register_rejects_invalid_opaque_protocol_label(
+        self, store, protocol,
+    ):
+        delivery_mode = getattr(msg_models, "DeliveryMode", None)
+        assert delivery_mode is not None
+
+        with pytest.raises(ValueError, match="consumer protocol is invalid"):
+            store.register_agent(
+                name="opaque",
+                pane_id="%8",
+                tmux_session="test",
+                agent_kind=AgentKind.CODEX,
+                consumer_protocol=protocol,
+                delivery_mode=delivery_mode.PULL,
+            )
+
+    def test_loading_corrupt_protocol_label_fails_closed(self, store):
+        agent = store.register_agent(
+            name="opaque",
+            pane_id="%8",
+            tmux_session="test",
+            agent_kind=AgentKind.CODEX,
+        )
+        with store._get_conn() as conn:
+            conn.execute(
+                "UPDATE agents SET consumer_protocol = ? WHERE session_id = ?",
+                ("bad\nlabel", agent.session_id),
+            )
+
+        with pytest.raises(ValueError, match="consumer protocol is invalid"):
+            store.get_agent_by_id(agent.session_id)
 
     def test_register_new_agent(self, store):
         agent = store.register_agent(
@@ -470,7 +555,7 @@ class TestAgentRegistration:
             pid=909,
             cwd="/new",
             process_start_identity="linux:909:90",
-            replace_candidate_session_id=candidate.session_id,
+            replace_registration_id=candidate.session_id,
         )
 
         assert moved.session_id == stable.session_id
@@ -486,23 +571,23 @@ class TestAgentRegistration:
             stable.session_id,
         ]
 
-    def test_retarget_moves_candidate_host_session_but_keeps_stable_title(
+    def test_retarget_moves_replacement_host_session_without_name_semantics(
         self, store,
     ):
         stable = store.register_agent(
-            "example-exec-docs_01", "%2", "test", AgentKind.CLAUDE,
+            "stable-endpoint", "%2", "test", AgentKind.CLAUDE,
             pid=102, cwd="/old", process_start_identity="linux:102:10",
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             host_session_id="host-old",
-            host_session_title="example-exec-docs_01",
         )
-        candidate = store.register_agent(
-            "example-exec-docs_01-candidate-a1", "%9", "test",
+        replacement = store.register_agent(
+            "unrelated-temporary", "%9", "test",
             AgentKind.CODEX,
             pid=909, cwd="/new", process_start_identity="linux:909:90",
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             host_session_id="host-new",
-            host_session_title="example-exec-docs_01-candidate-a1",
         )
 
         moved = store.retarget_agent(
@@ -513,87 +598,86 @@ class TestAgentRegistration:
             pid=909,
             cwd="/new",
             process_start_identity="linux:909:90",
-            replace_candidate_session_id=candidate.session_id,
+            replace_registration_id=replacement.session_id,
         )
 
         assert moved.session_id == stable.session_id
-        assert moved.name == "example-exec-docs_01"
+        assert moved.name == "stable-endpoint"
         assert moved.host_session_id == "host-new"
-        assert moved.host_session_title == "example-exec-docs_01"
+        assert not hasattr(moved, "host_session_title")
 
-    def test_retarget_first_mate_rejects_non_generation_candidate(self, store):
+    def test_retarget_does_not_interpret_replacement_name(self, store):
         stable = store.register_agent(
-            "example-exec-docs_01", "%2", "test", AgentKind.CLAUDE,
+            "stable-endpoint", "%2", "test", AgentKind.CLAUDE,
             pid=102, cwd="/old", process_start_identity="linux:102:10",
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             host_session_id="host-old",
-            host_session_title="example-exec-docs_01",
         )
-        candidate = store.register_agent(
+        replacement = store.register_agent(
             "unrelated", "%9", "test", AgentKind.CODEX,
             pid=909, cwd="/new", process_start_identity="linux:909:90",
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             host_session_id="host-new",
-            host_session_title="unrelated",
         )
 
-        with pytest.raises(ValueError, match="candidate name"):
-            store.retarget_agent(
-                stable.session_id,
-                "%9",
-                "test",
-                agent_kind=AgentKind.CODEX,
-                pid=909,
-                cwd="/new",
-                process_start_identity="linux:909:90",
-                replace_candidate_session_id=candidate.session_id,
-            )
+        moved = store.retarget_agent(
+            stable.session_id,
+            "%9",
+            "test",
+            agent_kind=AgentKind.CODEX,
+            pid=909,
+            cwd="/new",
+            process_start_identity="linux:909:90",
+            replace_registration_id=replacement.session_id,
+        )
 
-        assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
-        assert candidate.session_id in {
+        assert moved.pane_id == "%9"
+        assert moved.host_session_id == "host-new"
+        assert replacement.session_id not in {
             agent.session_id for agent in store.list_agents("test")
         }
 
-    def test_retarget_first_mate_rejects_reused_candidate_generation(self, store):
+    def test_retarget_does_not_treat_reused_name_as_generation(self, store):
         stable = store.register_agent(
-            "example-exec-docs_01", "%2", "test", AgentKind.CLAUDE,
+            "stable-endpoint", "%2", "test", AgentKind.CLAUDE,
             pid=102, cwd="/old", process_start_identity="linux:102:10",
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             host_session_id="host-old",
-            host_session_title="example-exec-docs_01",
         )
-        candidate_name = "example-exec-docs_01-candidate-a1"
-        old_candidate = store.register_agent(
-            candidate_name, "%8", "test", AgentKind.CODEX,
+        temporary_name = "reusable-temporary"
+        old_registration = store.register_agent(
+            temporary_name, "%8", "test", AgentKind.CODEX,
             pid=808, cwd="/old-candidate",
             process_start_identity="linux:808:80",
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             host_session_id="host-old",
-            host_session_title=candidate_name,
         )
-        assert store.retire_agent(old_candidate.session_id)
-        candidate = store.register_agent(
-            candidate_name, "%9", "test", AgentKind.CODEX,
+        assert store.retire_agent(old_registration.session_id)
+        replacement = store.register_agent(
+            temporary_name, "%9", "test", AgentKind.CODEX,
             pid=909, cwd="/new", process_start_identity="linux:909:90",
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
-            host_session_id="host-old",
-            host_session_title=candidate_name,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
+            host_session_id="host-new",
         )
 
-        with pytest.raises(ValueError, match="candidate generation was reused"):
-            store.retarget_agent(
-                stable.session_id,
-                "%9",
-                "test",
-                agent_kind=AgentKind.CODEX,
-                pid=909,
-                cwd="/new",
-                process_start_identity="linux:909:90",
-                replace_candidate_session_id=candidate.session_id,
-            )
+        moved = store.retarget_agent(
+            stable.session_id,
+            "%9",
+            "test",
+            agent_kind=AgentKind.CODEX,
+            pid=909,
+            cwd="/new",
+            process_start_identity="linux:909:90",
+            replace_registration_id=replacement.session_id,
+        )
 
-        assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
-        assert candidate.session_id in {
+        assert moved.host_session_id == "host-new"
+        assert replacement.session_id not in {
             agent.session_id for agent in store.list_agents("test")
         }
 
@@ -613,7 +697,7 @@ class TestAgentRegistration:
             "pid": 909,
             "cwd": "/new",
             "process_start_identity": "linux:909:90",
-            "replace_candidate_session_id": candidate.session_id,
+            "replace_registration_id": candidate.session_id,
         }
         first = store.retarget_agent(stable.session_id, "%9", "test", **kwargs)
 
@@ -627,8 +711,8 @@ class TestAgentRegistration:
     @pytest.mark.parametrize(
         "stage",
         (
-            "before_candidate_deactivate",
-            "after_candidate_deactivate",
+            "before_replacement_deactivate",
+            "after_replacement_deactivate",
             "after_stable_update",
         ),
     )
@@ -655,7 +739,7 @@ class TestAgentRegistration:
                 pid=909,
                 cwd="/new",
                 process_start_identity="linux:909:90",
-                replace_candidate_session_id=candidate.session_id,
+                replace_registration_id=candidate.session_id,
                 _failpoint=failpoint,
             )
 
@@ -671,7 +755,7 @@ class TestAgentRegistration:
             pid=909, cwd="/new", process_start_identity="linux:909:90",
         )
 
-        with pytest.raises(ValueError, match="candidate identity mismatch"):
+        with pytest.raises(ValueError, match="replacement identity mismatch"):
             store.retarget_agent(
                 stable.session_id,
                 "%9",
@@ -680,7 +764,7 @@ class TestAgentRegistration:
                 pid=909,
                 cwd="/new",
                 process_start_identity="linux:909:reused",
-                replace_candidate_session_id=candidate.session_id,
+                replace_registration_id=candidate.session_id,
             )
 
         assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
@@ -702,7 +786,7 @@ class TestAgentRegistration:
         )
         store.send_message(thread.id, sender.session_id, "candidate must drain")
 
-        with pytest.raises(ValueError, match="candidate has 1 unread delivery"):
+        with pytest.raises(ValueError, match="replacement has 1 unread delivery"):
             store.retarget_agent(
                 stable.session_id,
                 "%9",
@@ -711,7 +795,7 @@ class TestAgentRegistration:
                 pid=909,
                 cwd="/new",
                 process_start_identity="linux:909:90",
-                replace_candidate_session_id=candidate.session_id,
+                replace_registration_id=candidate.session_id,
             )
 
         assert store.get_agent_by_id(stable.session_id).pane_id == "%2"
@@ -756,14 +840,14 @@ class TestContinuationRecords:
                 now=datetime(2026, 1, 1),
             )
 
-    def test_legacy_registration_cannot_arm_continuation(self, store):
-        legacy = store.register_agent(
-            "legacy", "%1", "test", AgentKind.CLAUDE,
+    def test_push_registration_cannot_arm_continuation(self, store):
+        push = store.register_agent(
+            "push", "%1", "test", AgentKind.CLAUDE,
         )
 
-        with pytest.raises(ValueError, match="first-mate.v1"):
+        with pytest.raises(ValueError, match="pull registration"):
             store.set_continuation(
-                RegistrationIdentity.from_agent(legacy),
+                RegistrationIdentity.from_agent(push),
                 "assignment",
                 ttl_secs=90,
             )
@@ -893,7 +977,8 @@ class TestContinuationRecords:
             agent.tmux_session,
             agent.agent_kind,
             pid=agent.pid,
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=msg_models.DeliveryMode.PULL,
             process_start_identity="linux:101:2",
         )
 
@@ -925,8 +1010,8 @@ class TestContinuationRecords:
                 agent.agent_kind,
             )
 
-        assert store.get_agent_by_id(agent.session_id).consumer_protocol is (
-            ConsumerProtocol.FIRST_MATE_V1
+        assert store.get_agent_by_id(agent.session_id).consumer_protocol == (
+            "first-mate.v1"
         )
 
         assert store.clear_continuation(caller, "assignment")
@@ -937,7 +1022,7 @@ class TestContinuationRecords:
             agent.agent_kind,
         )
         assert downgraded.session_id == agent.session_id
-        assert downgraded.consumer_protocol is ConsumerProtocol.LEGACY
+        assert downgraded.consumer_protocol == "legacy"
         assert store.get_continuation_status(agent.session_id).state is (
             ContinuationState.IDLE
         )

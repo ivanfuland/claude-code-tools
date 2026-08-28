@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import stat
 import threading
 import time
+
+import pytest
 
 from claude_code_tools.msg import activation as activation_module
 from claude_code_tools.msg.activation import (
@@ -12,7 +15,7 @@ from claude_code_tools.msg.activation import (
     remove_activation,
     write_activation,
 )
-from claude_code_tools.msg.models import AgentKind, ConsumerProtocol
+from claude_code_tools.msg.models import AgentKind, DeliveryMode
 from claude_code_tools.msg.store import MsgStore
 
 
@@ -22,7 +25,8 @@ def test_activation_marker_is_atomic_private_and_scope_bound(tmp_path):
         "control", "%2", "main", AgentKind.CODEX, "/tmp/tmux",
         pid=202,
         cwd="/repo",
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PULL,
         process_start_identity="linux:202:2",
     )
 
@@ -54,7 +58,6 @@ def test_host_session_attestation_is_private_and_scope_bound(tmp_path):
         process_start_identity="linux:202:2",
         cwd="/repo",
         host_session_id="019d-host-session",
-        host_session_title="example-exec-docs_01",
         code_sha256="a" * 64,
     )
 
@@ -64,7 +67,7 @@ def test_host_session_attestation_is_private_and_scope_bound(tmp_path):
     )
     assert loaded["schema"] == "msg.host-session-attestation.v1"
     assert loaded["host_session_id"] == "019d-host-session"
-    assert loaded["host_session_title"] == "example-exec-docs_01"
+    assert "host_session_title" not in loaded
     assert activation_module.load_host_session_attestation(
         tmp_path / "msg.db", "main", "/tmp/other", "%2",
     ) is None
@@ -91,7 +94,6 @@ def test_host_session_attestation_completes_short_writes(monkeypatch, tmp_path):
         process_start_identity="linux:202:2",
         cwd="/repo",
         host_session_id="019d-host-session",
-        host_session_title="example-exec-docs_01",
         code_sha256="a" * 64,
     )
 
@@ -113,7 +115,6 @@ def test_host_session_attestation_symlink_fails_closed(tmp_path):
         process_start_identity="linux:202:2",
         cwd="/repo",
         host_session_id="019d-host-session",
-        host_session_title="example-exec-docs_01",
         code_sha256="a" * 64,
     )
     target = tmp_path / "untrusted.json"
@@ -130,12 +131,44 @@ def test_host_session_attestation_symlink_fails_closed(tmp_path):
     }
 
 
+@pytest.mark.parametrize("host_session_id", ("", "bad\nvalue", "界" * 86))
+def test_host_session_attestation_rejects_corrupt_host_id_on_load(
+    tmp_path, host_session_id,
+):
+    receipt = activation_module.write_host_session_attestation(
+        tmp_path / "msg.db",
+        tmux_session="main",
+        tmux_socket="/tmp/tmux",
+        pane_id="%2",
+        agent_kind=AgentKind.CODEX,
+        pid=202,
+        process_start_identity="linux:202:2",
+        cwd="/repo",
+        host_session_id="valid-host",
+        code_sha256="a" * 64,
+    )
+    payload = json.loads(receipt.path.read_text(encoding="utf-8"))
+    payload["host_session_id"] = host_session_id
+    receipt.path.write_text(json.dumps(payload), encoding="utf-8")
+    receipt.path.chmod(0o600)
+
+    loaded = activation_module.load_host_session_attestation(
+        tmp_path / "msg.db", "main", "/tmp/tmux", "%2",
+    )
+
+    assert loaded == {
+        "schema": "msg.host-session-attestation.v1",
+        "invalid": True,
+    }
+
+
 def test_loser_cleanup_cannot_delete_winner_marker(tmp_path):
     store = MsgStore(tmp_path / "msg.db")
     loser = store.register_agent(
         "loser", "%2", "main", AgentKind.CODEX, "/tmp/tmux",
         pid=202,
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PULL,
         process_start_identity="linux:202:2",
     )
     winner = type(loser)(
@@ -159,7 +192,8 @@ def test_old_generation_cannot_delete_new_same_session_marker(tmp_path):
     store = MsgStore(tmp_path / "msg.db")
     agent = store.register_agent(
         "control", "%2", "main", AgentKind.CODEX, "/tmp/tmux",
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PULL,
     )
     old = write_activation(store.db_path, agent)
     new = write_activation(store.db_path, agent)
@@ -175,7 +209,8 @@ def test_scope_lock_prevents_winner_replacement_between_check_and_unlink(tmp_pat
     store = MsgStore(tmp_path / "msg.db")
     agent = store.register_agent(
         "control", "%2", "main", AgentKind.CODEX, "/tmp/tmux",
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PULL,
     )
     old = write_activation(store.db_path, agent)
     checked = threading.Event()
@@ -220,7 +255,8 @@ def test_first_activation_fsyncs_db_parent_before_marker_directory(
     store = MsgStore(tmp_path / "msg.db")
     agent = store.register_agent(
         "control", "%2", "main", AgentKind.CODEX, "/tmp/tmux",
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PULL,
     )
     calls = []
     monkeypatch.setattr(
@@ -230,4 +266,4 @@ def test_first_activation_fsyncs_db_parent_before_marker_directory(
 
     write_activation(store.db_path, agent)
 
-    assert calls == [tmp_path, tmp_path / "first-mate-activations"]
+    assert calls == [tmp_path, tmp_path / "pull-activations"]

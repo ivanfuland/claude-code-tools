@@ -32,10 +32,10 @@ def agent_payload(agent: Agent) -> dict[str, Any]:
         "cwd": agent.cwd,
         "registered_at": agent.registered_at,
         "last_seen": agent.last_seen,
-        "consumer_protocol": agent.consumer_protocol.value,
+        "consumer_protocol": agent.consumer_protocol,
+        "delivery_mode": agent.delivery_mode.value,
         "process_start_identity": agent.process_start_identity,
         "host_session_id": agent.host_session_id,
-        "host_session_title": agent.host_session_title,
     }
 
 

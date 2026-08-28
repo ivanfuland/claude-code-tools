@@ -1,4 +1,4 @@
-"""DB-independent activation markers for fail-closed First-mate hooks."""
+"""DB-independent endpoint and pull-consumer activation markers."""
 
 from __future__ import annotations
 
@@ -14,16 +14,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .models import Agent, ConsumerProtocol
+from .models import (
+    Agent,
+    DeliveryMode,
+    validate_consumer_protocol,
+    validate_host_session_id,
+)
 
-ACTIVATION_SCHEMA = "msg.first-mate.activation.v1"
+ACTIVATION_SCHEMA = "msg.pull-activation.v1"
 HOST_SESSION_SCHEMA = "msg.host-session-attestation.v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_FIRST_MATE_SESSION_TITLE = re.compile(
-    r"^[a-z0-9][a-z0-9-]{0,31}-exec-"
-    r"[a-z0-9][a-z0-9-]{0,15}_[0-9]{2,}"
-    r"(?:-(?:candidate|old)-[a-z0-9]+)?$"
-)
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class ActivationReceipt:
 
 
 def _activation_dir(db_path: str | os.PathLike[str]) -> Path:
-    return Path(db_path).parent / "first-mate-activations"
+    return Path(db_path).parent / "pull-activations"
 
 
 def _host_session_dir(db_path: str | os.PathLike[str]) -> Path:
@@ -71,13 +71,6 @@ def _host_session_path(
     )
 
 
-def is_first_mate_session_title(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and _FIRST_MATE_SESSION_TITLE.fullmatch(value) is not None
-    )
-
-
 def write_host_session_attestation(
     db_path: str | os.PathLike[str],
     *,
@@ -89,18 +82,9 @@ def write_host_session_attestation(
     process_start_identity: str,
     cwd: str,
     host_session_id: str,
-    host_session_title: str | None,
     code_sha256: str,
 ) -> ActivationReceipt:
-    if (
-        not isinstance(host_session_id, str)
-        or not host_session_id
-        or len(host_session_id.encode("utf-8")) > 256
-        or any(
-            ord(character) < 32 or ord(character) == 127
-            for character in host_session_id
-        )
-    ):
+    if validate_host_session_id(host_session_id) is None:
         raise ValueError("host session id is invalid")
     if _SHA256.fullmatch(code_sha256) is None:
         raise ValueError("host session attestor code hash is invalid")
@@ -124,7 +108,6 @@ def write_host_session_attestation(
         "process_start_identity": process_start_identity,
         "cwd": cwd,
         "host_session_id": host_session_id,
-        "host_session_title": host_session_title,
         "code_sha256": code_sha256,
         "marker_generation": generation,
     }
@@ -187,6 +170,8 @@ def load_host_session_attestation(
             raise ValueError("schema")
         if _SHA256.fullmatch(str(payload.get("code_sha256", ""))) is None:
             raise ValueError("code hash")
+        if validate_host_session_id(payload.get("host_session_id")) is None:
+            raise ValueError("host session id")
         if (
             (tmux_session is not None
              and payload.get("tmux_session") != tmux_session)
@@ -230,9 +215,10 @@ def _fsync_directory(path: Path) -> None:
 def write_activation(
     db_path: str | os.PathLike[str], agent: Agent,
 ) -> ActivationReceipt:
-    """Atomically publish one private marker for a First-mate registration."""
-    if agent.consumer_protocol is not ConsumerProtocol.FIRST_MATE_V1:
-        raise ValueError("activation markers are only for first-mate.v1")
+    """Atomically publish one private marker for a pull registration."""
+    if agent.delivery_mode is not DeliveryMode.PULL:
+        raise ValueError("activation markers are only for pull registrations")
+    validate_consumer_protocol(agent.consumer_protocol)
     directory = _activation_dir(db_path)
     directory_existed = directory.is_dir()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -253,6 +239,8 @@ def write_activation(
         "pid": agent.pid,
         "process_start_identity": agent.process_start_identity,
         "cwd": agent.cwd,
+        "consumer_protocol": agent.consumer_protocol,
+        "delivery_mode": agent.delivery_mode.value,
         "marker_generation": generation,
     }
     with _scope_lock(db_path, agent.tmux_socket, agent.pane_id):
@@ -309,6 +297,9 @@ def load_activation(
         payload = json.loads(raw.decode("utf-8"))
         if payload.get("schema") != ACTIVATION_SCHEMA:
             raise ValueError("schema")
+        validate_consumer_protocol(payload.get("consumer_protocol"))
+        if DeliveryMode(payload.get("delivery_mode")) is not DeliveryMode.PULL:
+            raise ValueError("delivery mode")
         if (
             (tmux_session is not None and payload.get("tmux_session") != tmux_session)
             or payload.get("tmux_socket") != tmux_socket

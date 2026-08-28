@@ -26,9 +26,9 @@ SCHEMA_STATEMENTS = (
         registered_at TEXT NOT NULL,
         last_seen TEXT NOT NULL,
         consumer_protocol TEXT NOT NULL DEFAULT 'legacy',
+        delivery_mode TEXT NOT NULL DEFAULT 'push',
         process_start_identity TEXT,
         host_session_id TEXT,
-        host_session_title TEXT,
         active INTEGER NOT NULL DEFAULT 1,
         UNIQUE(name, tmux_session, tmux_socket)
     )""",
@@ -247,12 +247,17 @@ def initialize_database(conn: sqlite3.Connection) -> None:
             agent_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(agents)")
             }
+            if "delivery_mode" not in agent_columns:
+                conn.execute(
+                    "ALTER TABLE agents ADD COLUMN delivery_mode "
+                    "TEXT NOT NULL DEFAULT 'push'"
+                )
             if "host_session_id" not in agent_columns:
                 conn.execute("ALTER TABLE agents ADD COLUMN host_session_id TEXT")
-            if "host_session_title" not in agent_columns:
-                conn.execute(
-                    "ALTER TABLE agents ADD COLUMN host_session_title TEXT"
-                )
+            conn.execute(
+                "UPDATE agents SET delivery_mode = 'pull' "
+                "WHERE consumer_protocol = 'first-mate.v1'"
+            )
         if version < CURRENT_SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
         conn.commit()

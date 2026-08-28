@@ -14,7 +14,6 @@ from claude_code_tools.msg.migrations import (
 )
 from claude_code_tools.msg.models import (
     AgentKind,
-    ConsumerProtocol,
     RegistrationIdentity,
 )
 from claude_code_tools.msg.store import MsgStore
@@ -143,7 +142,7 @@ def test_version_three_adds_first_mate_fields_without_losing_history(tmp_path):
     migrated = MsgStore(str(path)).get_agent_by_id("legacy-agent")
 
     assert migrated is not None
-    assert migrated.consumer_protocol is ConsumerProtocol.LEGACY
+    assert migrated.consumer_protocol == "legacy"
     assert migrated.process_start_identity is None
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
@@ -176,6 +175,17 @@ def test_version_three_adds_first_mate_fields_without_losing_history(tmp_path):
 def test_version_four_to_five_preserves_history_and_continuation(tmp_path):
     path = tmp_path / "frozen-v4.db"
     create_frozen_v4_fixture(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """INSERT INTO agents (
+                session_id, name, pane_id, tmux_session, agent_kind,
+                registered_at, last_seen, active, consumer_protocol
+            ) VALUES (
+                'plain-agent', 'plain', '%2', 'main', 'codex',
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00', 1, 'legacy'
+            )"""
+        )
 
     migrated = MsgStore(str(path))
 
@@ -184,7 +194,6 @@ def test_version_four_to_five_preserves_history_and_continuation(tmp_path):
     )
     agent = migrated.get_agent_by_id("legacy-agent")
     assert agent.host_session_id is None
-    assert agent.host_session_title is None
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert conn.execute(
@@ -197,24 +206,47 @@ def test_version_four_to_five_preserves_history_and_continuation(tmp_path):
             "historical",
         )
         assert conn.execute("SELECT count(*) FROM deliveries").fetchone() == (1,)
-    assert {"host_session_id", "host_session_title"} <= columns
+        assert conn.execute(
+            "SELECT delivery_mode FROM agents WHERE session_id = 'legacy-agent'"
+        ).fetchone() == ("pull",)
+        assert conn.execute(
+            "SELECT delivery_mode FROM agents WHERE session_id = 'plain-agent'"
+        ).fetchone() == ("push",)
+    assert {"delivery_mode", "host_session_id"} <= columns
+    assert "host_session_title" not in columns
 
 
-def test_version_four_migration_failure_rolls_back_every_schema_change(tmp_path):
-    path = tmp_path / "rollback-v4.db"
+@pytest.mark.parametrize(
+    "failure_boundary",
+    ("first_alter", "second_alter", "protocol_mapping"),
+)
+def test_version_four_migration_failure_rolls_back_every_schema_change(
+    tmp_path, failure_boundary,
+):
+    path = tmp_path / f"rollback-v4-{failure_boundary}.db"
     create_frozen_v4_fixture(path)
     conn = sqlite3.connect(path)
     alter_calls = 0
 
-    def deny_second_alter(action, _arg1, _arg2, _database, _trigger):
+    def deny_boundary(action, arg1, arg2, _database, _trigger):
         nonlocal alter_calls
         if action == sqlite3.SQLITE_ALTER_TABLE:
             alter_calls += 1
-            if alter_calls == 2:
+            alter_boundary = (
+                "first_alter" if alter_calls == 1 else "second_alter"
+            )
+            if failure_boundary == alter_boundary:
                 return sqlite3.SQLITE_DENY
+        if (
+            failure_boundary == "protocol_mapping"
+            and action == sqlite3.SQLITE_UPDATE
+            and arg1 == "agents"
+            and arg2 == "delivery_mode"
+        ):
+            return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
-    conn.set_authorizer(deny_second_alter)
+    conn.set_authorizer(deny_boundary)
     with pytest.raises(sqlite3.DatabaseError, match="authorized"):
         initialize_database(conn)
     conn.close()
@@ -238,7 +270,7 @@ def test_version_four_migration_failure_rolls_back_every_schema_change(tmp_path)
             "historical"
         )
     assert {"consumer_protocol", "process_start_identity"} <= agent_columns
-    assert {"host_session_id", "host_session_title"}.isdisjoint(agent_columns)
+    assert {"delivery_mode", "host_session_id"}.isdisjoint(agent_columns)
     assert {
         "process_start_identity",
         "distribution_version",

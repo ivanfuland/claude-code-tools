@@ -15,19 +15,18 @@ checks. The command auto-detects everything it needs.
 msg register $ARGUMENTS
 ```
 
-This command keeps the legacy notification route. A First-mate-managed
-session is registered by the First-mate bootstrap instead:
+This command keeps the default push notification route. A durable pull
+consumer registers an opaque upper-layer protocol label explicitly:
 
 ```bash
-msg register --consumer-protocol first-mate.v1 --json $ARGUMENTS
+msg register --consumer-protocol <protocol-id> --delivery-mode pull --json $ARGUMENTS
 ```
 
-The First-mate bootstrap must first obtain a native SessionStart attestation.
-Its allocated name, native session title, and tmux window name must match the
-`<project>-exec-<suffix>_<NN>` contract; `msg register` does not accept a
-caller-supplied host session ID.
+The plugin SessionStart hook records an optional opaque host-session endpoint
+fact. `msg register` attaches it only when pane/Harness/PID/start/cwd match;
+the CLI never accepts a caller-supplied host session ID or interprets names.
 
-Do not switch an existing registration between protocols while it owns an
-armed continuation record.
+Do not switch an existing registration from pull to push while it owns an
+active wake lease.
 
 Show the output to the user. You are done.

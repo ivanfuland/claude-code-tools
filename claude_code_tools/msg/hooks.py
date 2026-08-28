@@ -13,28 +13,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import selectors
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import click
 
-from claude_code_tools import __version__ as CCTOOLS_VERSION
 from claude_code_tools.amux.scan import resolve_pane_agent
 from claude_code_tools.process_identity import process_start_identity
 
 from .activation import (
-    is_first_mate_session_title,
     load_activation,
-    load_host_session_attestation,
     write_host_session_attestation,
 )
 from .models import (
     AgentKind,
-    ConsumerProtocol,
     ContinuationState,
+    DeliveryMode,
     RegistrationIdentity,
     _new_uuid,
 )
@@ -43,9 +38,6 @@ from .store import DEFAULT_DB_PATH, MsgStore
 _LOADED_HOOK_MODULE_SHA256 = hashlib.sha256(
     Path(__file__).read_bytes(),
 ).hexdigest()
-_CODEX_APP_SERVER_COMMAND = (
-    "codex", "app-server", "--listen", "stdio://",
-)
 
 
 def hook_module_sha256() -> str:
@@ -85,23 +77,6 @@ def _current_tmux_locator() -> tuple[str | None, str] | None:
     return tmux_socket, pane_id
 
 
-def _current_window_name(
-    tmux_socket: str | None, pane_id: str,
-) -> str | None:
-    cmd = ["tmux"]
-    if tmux_socket:
-        cmd += ["-S", tmux_socket]
-    cmd += ["display-message", "-t", pane_id, "-p", "#{window_name}"]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    value = result.stdout.rstrip("\n")
-    return value or None
-
-
 def _attest_host_session(hook_input: object) -> None:
     if not isinstance(hook_input, dict):
         raise TypeError("hook input is invalid")
@@ -122,8 +97,7 @@ def _attest_host_session(hook_input: object) -> None:
     if target is None:
         raise ValueError("TUI identity is unavailable")
     start_identity = process_start_identity(target.pid)
-    title = _current_window_name(tmux_socket, pane_id)
-    if start_identity is None or title is None:
+    if start_identity is None:
         raise ValueError("host identity is incomplete")
     write_host_session_attestation(
         DEFAULT_DB_PATH,
@@ -135,174 +109,8 @@ def _attest_host_session(hook_input: object) -> None:
         process_start_identity=start_identity,
         cwd=target.cwd,
         host_session_id=host_session_id,
-        host_session_title=title,
         code_sha256=hook_module_sha256(),
     )
-
-
-def _set_codex_session_title(host_session_id: str, title: str) -> bool:
-    process = None
-    selector = None
-    readback = None
-    try:
-        process = subprocess.Popen(
-            _CODEX_APP_SERVER_COMMAND,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        if process.stdin is None or process.stdout is None or process.stderr is None:
-            return False
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-        deadline = time.monotonic() + 4.0
-        stdout_buffer = bytearray()
-
-        def write_message(value: dict) -> None:
-            payload = (
-                json.dumps(value, separators=(",", ":")) + "\n"
-            ).encode("utf-8")
-            view = memoryview(payload)
-            while view:
-                written = os.write(process.stdin.fileno(), view)
-                if written <= 0:
-                    raise OSError("Codex app-server write made no progress")
-                view = view[written:]
-
-        def buffered_response(request_id: int) -> dict | None:
-            while True:
-                newline = stdout_buffer.find(b"\n")
-                if newline < 0:
-                    return None
-                raw = bytes(stdout_buffer[:newline])
-                del stdout_buffer[:newline + 1]
-                try:
-                    response = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if (
-                    isinstance(response, dict)
-                    and response.get("id") == request_id
-                ):
-                    return response
-
-        def read_response(request_id: int) -> dict | None:
-            while time.monotonic() < deadline:
-                response = buffered_response(request_id)
-                if response is not None:
-                    return response
-                remaining = max(0.0, deadline - time.monotonic())
-                events = selector.select(timeout=remaining)
-                if not events:
-                    if process.poll() is not None:
-                        return None
-                    continue
-                for key, _mask in events:
-                    chunk = os.read(key.fileobj.fileno(), 65_536)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    if key.data == "stdout":
-                        stdout_buffer.extend(chunk)
-            return None
-
-        write_message({
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "msg-hook",
-                    "title": "msg First-mate Hook",
-                    "version": CCTOOLS_VERSION,
-                },
-            },
-        })
-        initialized = read_response(0)
-        if not initialized or "error" in initialized:
-            return False
-        write_message({"method": "initialized"})
-        write_message({
-            "id": 1,
-            "method": "thread/name/set",
-            "params": {"threadId": host_session_id, "name": title},
-        })
-        renamed = read_response(1)
-        if not renamed or "error" in renamed:
-            return False
-        write_message({
-            "id": 2,
-            "method": "thread/read",
-            "params": {"threadId": host_session_id, "includeTurns": False},
-        })
-        readback = read_response(2)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return False
-    finally:
-        if selector is not None:
-            selector.close()
-        if process is not None:
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-            if process.poll() is None:
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                try:
-                    process.kill()
-                    process.wait(timeout=1)
-                except OSError:
-                    pass
-    if not readback or "error" in readback:
-        return False
-    return ((readback.get("result") or {}).get("thread") or {}).get("name") == title
-
-
-def _bootstrap_title_response(
-    hook_event: str, scope: tuple[str, str | None, str] | None,
-) -> dict | None:
-    if hook_event not in {"UserPromptSubmit", "Stop"} or scope is None:
-        return None
-    tmux_session, tmux_socket, pane_id = scope
-    attestation = load_host_session_attestation(
-        DEFAULT_DB_PATH, tmux_session, tmux_socket, pane_id,
-    )
-    if not attestation or attestation.get("invalid"):
-        return None
-    title = attestation.get("host_session_title")
-    host_session_id = attestation.get("host_session_id")
-    if (
-        not isinstance(title, str)
-        or not is_first_mate_session_title(title)
-        or not isinstance(host_session_id, str)
-        or not host_session_id
-    ):
-        return None
-    kind = attestation.get("agent_kind")
-    if kind == AgentKind.CLAUDE.value:
-        if hook_event != "UserPromptSubmit":
-            return None
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "sessionTitle": title,
-            }
-        }
-    if kind == AgentKind.CODEX.value:
-        if hook_event != "Stop":
-            return None
-        if not _set_codex_session_title(host_session_id, title):
-            raise ValueError("Codex session title readback failed")
-        return {}
-    return None
 
 
 def _find_self_agent(store: MsgStore) -> object | None:
@@ -319,7 +127,7 @@ def _find_self_agent(store: MsgStore) -> object | None:
     if len(matches) != 1:
         return None
     agent = matches[0]
-    if agent.consumer_protocol is ConsumerProtocol.LEGACY:
+    if agent.delivery_mode is DeliveryMode.PUSH:
         return agent
     target = resolve_pane_agent(agent.pane_id, agent.tmux_socket)
     if target is None:
@@ -361,17 +169,12 @@ def _check_and_notify(
         try:
             _attest_host_session(hook_input)
         except (OSError, TypeError, ValueError):
-            _emit_first_mate_recovery(hook_event)
+            _emit_pull_recovery(hook_event, "unknown")
             return
         _approve(json_object=True)
         return
 
     scope = _current_tmux_scope()
-    try:
-        title_response = _bootstrap_title_response(hook_event, scope)
-    except ValueError:
-        _emit_first_mate_recovery(hook_event)
-        return
     marker = None
     if scope is not None:
         marker = load_activation(DEFAULT_DB_PATH, *scope)
@@ -387,7 +190,9 @@ def _check_and_notify(
         store = MsgStore()
     except Exception:
         if marker:
-            _emit_first_mate_recovery(hook_event)
+            _emit_pull_recovery(
+                hook_event, str(marker.get("consumer_protocol", "unknown")),
+            )
             return
         _approve(
             json_object=(
@@ -400,28 +205,31 @@ def _check_and_notify(
 
     try:
         me = _find_self_agent(store)
-        candidates = []
+        pane_agents = []
         if scope is not None:
             tmux_session, tmux_socket, pane_id = scope
-            candidates = [
+            pane_agents = [
                 agent for agent in store.list_agents(tmux_session, tmux_socket)
                 if agent.pane_id == pane_id and agent.tmux_socket == tmux_socket
             ]
-        known_first_mate = any(
-            agent.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
-            for agent in candidates
+        known_pull = any(
+            agent.delivery_mode is DeliveryMode.PULL
+            for agent in pane_agents
         )
     except Exception:
         if marker:
-            _emit_first_mate_recovery(hook_event)
+            _emit_pull_recovery(
+                hook_event, str(marker.get("consumer_protocol", "unknown")),
+            )
             return
         raise
     if not me:
-        if title_response is not None:
-            print(json.dumps(title_response))
-            return
-        if marker or known_first_mate:
-            _emit_first_mate_recovery(hook_event)
+        if marker or known_pull:
+            protocol = (
+                str(marker.get("consumer_protocol", "unknown"))
+                if marker else "unknown"
+            )
+            _emit_pull_recovery(hook_event, protocol)
             return
         _approve(
             json_object=(
@@ -432,14 +240,14 @@ def _check_and_notify(
         )
         return
 
-    if marker and me.consumer_protocol is not ConsumerProtocol.FIRST_MATE_V1:
-        _emit_first_mate_recovery(hook_event)
+    if marker and me.delivery_mode is not DeliveryMode.PULL:
+        _emit_pull_recovery(hook_event, me.consumer_protocol)
         return
-    if me.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1:
+    if me.delivery_mode is DeliveryMode.PULL:
         try:
-            _first_mate_hook(store, me, hook_event, hook_input)
+            _pull_hook(store, me, hook_event, hook_input)
         except Exception:
-            _emit_first_mate_recovery(hook_event)
+            _emit_pull_recovery(hook_event, me.consumer_protocol)
         return
 
     if hook_event == "PostToolUse":
@@ -492,13 +300,13 @@ def _check_and_notify(
         store.mark_notified(delivery["id"], claimer_id)
 
 
-def _first_mate_hook(
+def _pull_hook(
     store: MsgStore,
     me: object,
     hook_event: str,
     _hook_input: object,
 ) -> None:
-    """Emit bounded native-hook state without consuming First-mate delivery."""
+    """Emit bounded native-hook state without consuming pull delivery."""
     identity = RegistrationIdentity.from_agent(me)
     if hook_event == "PostToolUse":
         status = store.get_continuation_status(me.session_id)
@@ -514,20 +322,17 @@ def _first_mate_hook(
 
     pending = store.count_pending_deliveries(me.session_id)
     continuation = store.get_continuation_status(me.session_id)
+    marker = (
+        f"[MSG pull protocol={me.consumer_protocol}] "
+        f"pending={pending}; lease={continuation.state.value}."
+    )
     if hook_event == "Stop":
         if pending == 0 and continuation.state is ContinuationState.IDLE:
             _approve(json_object=True)
             return
-        if continuation.state is ContinuationState.ACTIVE_STALE:
-            action = "Run $first-mate recovery before resuming bounded wait."
-        else:
-            action = "Run $first-mate wait and continue the armed responsibility."
         print(json.dumps({
             "decision": "block",
-            "reason": (
-                f"{action} pending_deliveries={pending}; "
-                f"continuation={continuation.state.value}."
-            ),
+            "reason": marker,
         }))
         return
 
@@ -538,11 +343,7 @@ def _first_mate_hook(
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": (
-                    "[FIRST-MATE] Invoke $first-mate before ordinary work; "
-                    f"pending_deliveries={pending}; "
-                    f"continuation={continuation.state.value}."
-                ),
+                "additionalContext": marker,
             }
         }))
         return
@@ -550,10 +351,10 @@ def _first_mate_hook(
     _approve(json_object=True)
 
 
-def _emit_first_mate_recovery(hook_event: str) -> None:
+def _emit_pull_recovery(hook_event: str, protocol: str) -> None:
     message = (
-        "[FIRST-MATE] Run $first-mate recovery; "
-        "msg state is unavailable or identity is stale."
+        f"[MSG pull protocol={protocol}] "
+        "pending=unknown; lease=recovery_required."
     )
     if hook_event == "Stop":
         print(json.dumps({"decision": "block", "reason": message}))

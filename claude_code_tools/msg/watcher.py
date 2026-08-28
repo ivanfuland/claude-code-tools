@@ -23,7 +23,7 @@ from collections import defaultdict
 from enum import Enum
 from pathlib import Path
 
-from .models import AgentKind, ConsumerProtocol, _new_uuid
+from .models import AgentKind, DeliveryMode, _new_uuid
 from .prompt_detect import PromptState, detect_prompt_state
 from .store import MsgStore, DEFAULT_DB_PATH
 from claude_code_tools.process_identity import process_start_identity
@@ -48,24 +48,24 @@ class NotificationRoute(str, Enum):
 
 def notification_route(
     agent_kind: AgentKind | str,
-    consumer_protocol: ConsumerProtocol | str,
+    delivery_mode: DeliveryMode | str,
 ) -> NotificationRoute:
-    """Map the closed Harness/protocol pair to one notification route."""
+    """Map the closed Harness/delivery-mode pair to one route."""
     kind = AgentKind(agent_kind)
-    protocol = ConsumerProtocol(consumer_protocol)
+    mode = DeliveryMode(delivery_mode)
     routes = {
-        (AgentKind.CLAUDE, ConsumerProtocol.LEGACY): NotificationRoute.LEGACY_TMUX,
-        (AgentKind.CODEX, ConsumerProtocol.LEGACY): NotificationRoute.LEGACY_TMUX,
+        (AgentKind.CLAUDE, DeliveryMode.PUSH): NotificationRoute.LEGACY_TMUX,
+        (AgentKind.CODEX, DeliveryMode.PUSH): NotificationRoute.LEGACY_TMUX,
         (
             AgentKind.CLAUDE,
-            ConsumerProtocol.FIRST_MATE_V1,
+            DeliveryMode.PULL,
         ): NotificationRoute.NATIVE_HOOK_WAIT,
         (
             AgentKind.CODEX,
-            ConsumerProtocol.FIRST_MATE_V1,
+            DeliveryMode.PULL,
         ): NotificationRoute.NATIVE_HOOK_WAIT,
     }
-    return routes[(kind, protocol)]
+    return routes[(kind, mode)]
 
 
 def _read_distribution_version() -> str:
@@ -165,10 +165,10 @@ class Watcher:
     async def _process_pending(self) -> None:
         """Claim and process pending deliveries."""
         try:
-            for protocol, count in self.store.unknown_pending_consumer_protocols():
+            for mode, count in self.store.unknown_pending_delivery_modes():
                 logger.error(
-                    "Unknown consumer protocol %r blocks %d delivery(s)",
-                    protocol, count,
+                    "Unknown delivery mode %r blocks %d delivery(s)",
+                    mode, count,
                 )
             released = self.store.release_expired_claims()
             if released:
@@ -223,11 +223,11 @@ class Watcher:
             agent_kind = deliveries[0].get(
                 "recipient_agent_kind", "claude",
             )
-            consumer_protocol = deliveries[0].get(
-                "recipient_consumer_protocol",
+            delivery_mode = deliveries[0].get(
+                "recipient_delivery_mode",
             )
             try:
-                route = notification_route(agent_kind, consumer_protocol)
+                route = notification_route(agent_kind, delivery_mode)
             except (KeyError, ValueError):
                 logger.error(
                     "Unknown notification route for recipient %s",

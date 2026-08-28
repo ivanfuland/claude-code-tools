@@ -15,7 +15,7 @@ import claude_code_tools
 from claude_code_tools.amux.scan import resolve_pane_agent
 from claude_code_tools.msg.models import (
     AgentKind,
-    ConsumerProtocol,
+    DeliveryMode,
     RegistrationIdentity,
 )
 from claude_code_tools.msg.store import MsgStore
@@ -113,7 +113,7 @@ def test_both_marketplaces_expose_updated_msg_metadata():
     claude_msg = next(item for item in claude["plugins"] if item["name"] == "msg")
     codex_msg = next(item for item in codex["plugins"] if item["name"] == "msg")
 
-    assert "native First-mate lifecycle hooks" in claude_msg["description"]
+    assert "native push/pull lifecycle hooks" in claude_msg["description"]
     assert codex_msg["interface"]["displayName"] == "Msg"
     assert "native lifecycle hooks" in codex_msg["interface"]["shortDescription"]
 
@@ -155,7 +155,8 @@ def test_codex_hook_commands_need_no_root_env_or_plugin_cwd(tmp_path):
             display_addr=target.pane,
             pid=target.pid,
             cwd=target.cwd,
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=DeliveryMode.PULL,
             process_start_identity=process_start_identity(target.pid),
         )
         thread = store.create_thread(
@@ -219,6 +220,9 @@ def test_codex_hook_commands_need_no_root_env_or_plugin_cwd(tmp_path):
         context = json.loads(prompt.stdout)["hookSpecificOutput"][
             "additionalContext"
         ]
-        assert "$first-mate" in context
+        assert context == (
+            "[MSG pull protocol=first-mate.v1] "
+            "pending=1; lease=active_fresh."
+        )
         assert "opaque-user-prompt" not in prompt.stdout
         assert store.get_inbox(receiver.session_id)[0]["state"] == "pending"

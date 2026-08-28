@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from claude_code_tools.msg.models import AgentKind, ConsumerProtocol
+from claude_code_tools.msg.models import AgentKind, DeliveryMode
 from claude_code_tools.msg.prompt_detect import PromptState
 from claude_code_tools.msg import store as store_module
 from claude_code_tools.msg import watcher as watcher_module
@@ -24,24 +24,24 @@ from claude_code_tools.msg.migrations import CURRENT_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize(
-    ("kind", "protocol", "route"),
+    ("kind", "mode", "route"),
     (
-        (AgentKind.CLAUDE, ConsumerProtocol.LEGACY, NotificationRoute.LEGACY_TMUX),
-        (AgentKind.CODEX, ConsumerProtocol.LEGACY, NotificationRoute.LEGACY_TMUX),
+        (AgentKind.CLAUDE, DeliveryMode.PUSH, NotificationRoute.LEGACY_TMUX),
+        (AgentKind.CODEX, DeliveryMode.PUSH, NotificationRoute.LEGACY_TMUX),
         (
             AgentKind.CLAUDE,
-            ConsumerProtocol.FIRST_MATE_V1,
+            DeliveryMode.PULL,
             NotificationRoute.NATIVE_HOOK_WAIT,
         ),
         (
             AgentKind.CODEX,
-            ConsumerProtocol.FIRST_MATE_V1,
+            DeliveryMode.PULL,
             NotificationRoute.NATIVE_HOOK_WAIT,
         ),
     ),
 )
-def test_notification_route_is_closed(kind, protocol, route):
-    assert notification_route(kind, protocol) is route
+def test_notification_route_is_closed(kind, mode, route):
+    assert notification_route(kind, mode) is route
 
 
 @pytest.mark.parametrize(
@@ -55,7 +55,8 @@ def test_first_mate_delivery_stays_pending_and_never_touches_tmux(
     sender = watcher.store.register_agent("sender", "%1", "test", AgentKind.CLAUDE)
     recipient = watcher.store.register_agent(
         "receiver", "%2", "test", kind,
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PULL,
     )
     thread = watcher.store.create_thread(
         "first-mate", sender.session_id, [sender.session_id, recipient.session_id],
@@ -85,7 +86,8 @@ def test_watcher_claims_legacy_but_not_first_mate_recipient(tmp_path):
     legacy = watcher.store.register_agent("legacy", "%2", "test", AgentKind.CODEX)
     first_mate = watcher.store.register_agent(
         "first-mate", "%3", "test", AgentKind.CODEX,
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PULL,
     )
     thread = watcher.store.create_thread(
         "mixed", sender.session_id,
@@ -100,13 +102,13 @@ def test_watcher_claims_legacy_but_not_first_mate_recipient(tmp_path):
     assert watcher.store.get_inbox(first_mate.session_id)[0]["state"] == "pending"
 
 
-def test_unknown_consumer_protocol_fails_closed_and_records_error(caplog, tmp_path):
+def test_unknown_delivery_mode_fails_closed_and_records_error(caplog, tmp_path):
     watcher = Watcher(str(tmp_path / "msg.db"))
     sender = watcher.store.register_agent("sender", "%1", "test", AgentKind.CLAUDE)
     recipient = watcher.store.register_agent("receiver", "%2", "test", AgentKind.CODEX)
     with sqlite3.connect(watcher.store.db_path) as connection:
         connection.execute(
-            "UPDATE agents SET consumer_protocol = 'unknown' WHERE session_id = ?",
+            "UPDATE agents SET delivery_mode = 'unknown' WHERE session_id = ?",
             (recipient.session_id,),
         )
     thread = watcher.store.create_thread(
@@ -145,7 +147,8 @@ def test_protocol_upgrade_cannot_race_an_inflight_legacy_claim(
             recipient.tmux_session,
             recipient.agent_kind,
             recipient.tmux_socket,
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=DeliveryMode.PULL,
         )
     watcher.store.release_delivery(claimed[0]["id"], watcher.watcher_id)
     upgraded = watcher.store.register_agent(
@@ -154,7 +157,8 @@ def test_protocol_upgrade_cannot_race_an_inflight_legacy_claim(
         recipient.tmux_session,
         recipient.agent_kind,
         recipient.tmux_socket,
-        consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+        consumer_protocol="first-mate.v1",
+        delivery_mode=DeliveryMode.PULL,
     )
     sent = []
 
@@ -164,7 +168,8 @@ def test_protocol_upgrade_cannot_race_an_inflight_legacy_claim(
     monkeypatch.setattr(watcher, "_tmux_send", record_send)
     asyncio.run(watcher._deliver_to_recipient(recipient.session_id, claimed))
 
-    assert upgraded.consumer_protocol is ConsumerProtocol.FIRST_MATE_V1
+    assert upgraded.consumer_protocol == "first-mate.v1"
+    assert upgraded.delivery_mode is DeliveryMode.PULL
     assert sent == []
     assert watcher.store.get_inbox(recipient.session_id)[0]["state"] == "pending"
 

@@ -23,17 +23,16 @@ msg register <your-name>
 This auto-detects your tmux pane. You only need to do
 this once per session.
 
-First-mate bootstraps its managed sessions with the closed protocol value:
+Durable pull consumers register an opaque protocol label plus delivery mode:
 
 ```bash
-msg register --consumer-protocol first-mate.v1 --json <your-name>
+msg register --consumer-protocol <protocol-id> --delivery-mode pull --json <your-name>
 ```
 
-The default remains `legacy`. Before this registration, the native
-`SessionStart` hook must have attested the real Claude/Codex host session.
-First-mate names use `<project>-exec-<suffix>_<NN>`; the attested native title
-and tmux window must match exactly. Never pass or invent a host session ID on
-the command line.
+The default remains protocol `legacy` with delivery mode `push`. The native
+`SessionStart` hook records an optional opaque Claude/Codex host session fact;
+registration attaches it only to the exact physical endpoint. Never pass or
+invent a host session ID on the command line.
 
 ## Sending Messages
 
@@ -66,26 +65,24 @@ msg inbox
 This shows all unread messages grouped by thread and
 marks them as read.
 
-For a `first-mate.v1` registration, never use that legacy read-and-mark path.
-Invoke `$first-mate`; its helper repeatedly peeks a bounded page, fsyncs the
-recipient journal, then explicitly acknowledges exact delivery IDs. The
-helper owns assignment-generation reconciliation and refreshes an existing
-continuation heartbeat every 45 seconds with a 90-second TTL. The hooks never
-create or replace a generation.
+For a pull registration, never use that legacy read-and-mark path. Invoke the
+handler identified by the registration's opaque protocol label. It repeatedly
+peeks a bounded page, durably journals it, then explicitly acknowledges exact
+delivery IDs. Hooks may touch an existing wake lease but never create or
+replace its generation.
 
 Plugin-native `SessionStart`, `PostToolUse`, `Stop`, and `UserPromptSubmit`
-hooks attest the resumable host session and keep an armed responsibility in
-the agent loop. A stale heartbeat routes to recovery; it does not clear
-responsibility or classify the Agent as parked/dead. Exact clear with no
-pending delivery allows Stop, so a parked Agent does not self-start another
-turn. First-mate delivery never uses tmux prompt injection.
+hooks attest the resumable host endpoint and keep an armed pull consumer in
+the agent loop. A stale heartbeat emits a generic recovery-required marker;
+it never clears the lease. Exact clear with no pending delivery allows Stop.
+Pull delivery never uses tmux prompt injection.
 
 Codex treats plugin hooks as non-managed code and skips changed definitions
 until the user reviews and trusts the current hash in `/hooks`. Never bypass
 that trust decision. A plugin upgrade requires a fresh review when hook bytes
 change. That trust covers the hook definition, not imported adapter bytes; the
-release evidence and First-mate doctor must separately verify the complete
-plugin payload and reject same-version tree drift.
+release evidence and the consuming protocol's verifier must separately check
+the complete plugin payload and reject same-version tree drift.
 
 ## Other Commands
 

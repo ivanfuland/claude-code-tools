@@ -7,6 +7,8 @@ import json
 import click
 from click.testing import CliRunner
 
+import claude_code_tools.msg.models as msg_models
+
 from claude_code_tools.msg.cli import json_option
 from claude_code_tools.msg.json_contract import (
     agent_payload,
@@ -18,7 +20,6 @@ from claude_code_tools.msg.json_contract import (
 from claude_code_tools.msg.models import (
     Agent,
     AgentKind,
-    ConsumerProtocol,
     Delivery,
     DeliveryState,
     Message,
@@ -27,6 +28,8 @@ from claude_code_tools.msg.models import (
 
 
 def test_agent_payload_is_complete_and_json_compatible():
+    delivery_mode = getattr(msg_models, "DeliveryMode", None)
+    assert delivery_mode is not None
     payload = agent_payload(
         Agent(
             session_id="agent-1",
@@ -40,7 +43,8 @@ def test_agent_payload_is_complete_and_json_compatible():
             cwd="/workspace",
             registered_at="2026-01-01T00:00:00+00:00",
             last_seen="2026-01-01T00:00:01+00:00",
-            consumer_protocol=ConsumerProtocol.FIRST_MATE_V1,
+            consumer_protocol="first-mate.v1",
+            delivery_mode=delivery_mode.PULL,
             process_start_identity="linux:4242:100",
         )
     )
@@ -58,9 +62,9 @@ def test_agent_payload_is_complete_and_json_compatible():
         "registered_at": "2026-01-01T00:00:00+00:00",
         "last_seen": "2026-01-01T00:00:01+00:00",
         "consumer_protocol": "first-mate.v1",
+        "delivery_mode": "pull",
         "process_start_identity": "linux:4242:100",
         "host_session_id": None,
-        "host_session_title": None,
     }
     json.dumps(payload)
 

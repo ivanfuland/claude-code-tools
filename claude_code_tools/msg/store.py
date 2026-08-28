@@ -9,20 +9,21 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .activation import is_first_mate_session_title
 from .migrations import adopt_unique_legacy_registration, initialize_database
 from .models import (
     Agent,
     AgentKind,
-    ConsumerProtocol,
     ContinuationState,
     ContinuationStatus,
+    DeliveryMode,
     Message,
     RegistrationIdentity,
     Thread,
     WatcherHeartbeat,
     _new_uuid,
     _now_iso,
+    validate_consumer_protocol,
+    validate_host_session_id,
 )
 
 DEFAULT_DB_DIR = os.environ.get(
@@ -120,13 +121,19 @@ class MsgStore:
         display_addr: str | None = None,
         pid: int | None = None,
         cwd: str | None = None,
-        consumer_protocol: ConsumerProtocol = ConsumerProtocol.LEGACY,
+        consumer_protocol: str = "legacy",
+        delivery_mode: DeliveryMode = DeliveryMode.PUSH,
         process_start_identity: str | None = None,
         host_session_id: str | None = None,
-        host_session_title: str | None = None,
     ) -> Agent:
         """Register an agent, preserving active-session idempotency."""
         _validate_agent_name(name)
+        protocol_value = validate_consumer_protocol(consumer_protocol)
+        try:
+            mode_value = DeliveryMode(delivery_mode)
+        except ValueError as exc:
+            raise ValueError("delivery mode is invalid") from exc
+        host_id_value = validate_host_session_id(host_session_id)
         now = _now_iso()
         conn = self._get_conn()
         try:
@@ -184,12 +191,15 @@ class MsgStore:
 
             if existing:
                 session_id = existing["session_id"]
-                existing_protocol = conn.execute(
-                    """SELECT consumer_protocol FROM agents
+                existing_delivery = conn.execute(
+                    """SELECT consumer_protocol, delivery_mode FROM agents
                     WHERE session_id = ?""",
                     (session_id,),
-                ).fetchone()["consumer_protocol"]
-                if existing_protocol != consumer_protocol.value:
+                ).fetchone()
+                if (
+                    existing_delivery["consumer_protocol"] != protocol_value
+                    or existing_delivery["delivery_mode"] != mode_value.value
+                ):
                     conn.execute(
                         RELEASE_EXPIRED_SQL,
                         (now, session_id, session_id),
@@ -201,11 +211,11 @@ class MsgStore:
                         (session_id,),
                     ).fetchone():
                         raise ValueError(
-                            "agent has a delivery in flight; retry protocol change"
+                            "agent has a delivery in flight; retry delivery change"
                         )
                 if (
-                    existing_protocol == ConsumerProtocol.FIRST_MATE_V1.value
-                    and consumer_protocol is ConsumerProtocol.LEGACY
+                    existing_delivery["delivery_mode"] == DeliveryMode.PULL.value
+                    and mode_value is DeliveryMode.PUSH
                     and conn.execute(
                         """SELECT 1 FROM continuation_leases
                         WHERE agent_id = ?""",
@@ -220,16 +230,15 @@ class MsgStore:
                         pane_id = ?, display_addr = ?,
                         agent_kind = ?, pid = ?, cwd = ?,
                         last_seen = ?, tmux_socket = ?,
-                        consumer_protocol = ?, process_start_identity = ?,
-                        host_session_id = ?, host_session_title = ?,
+                        consumer_protocol = ?, delivery_mode = ?,
+                        process_start_identity = ?, host_session_id = ?,
                         active = 1
                     WHERE session_id = ?""",
                     (
                         pane_id, display_addr,
                         agent_kind.value, pid, cwd,
-                        now, tmux_socket, consumer_protocol.value,
-                        process_start_identity, host_session_id,
-                        host_session_title, session_id,
+                        now, tmux_socket, protocol_value, mode_value.value,
+                        process_start_identity, host_id_value, session_id,
                     ),
                 )
             else:
@@ -240,16 +249,15 @@ class MsgStore:
                         tmux_session, tmux_socket,
                         display_addr, agent_kind, pid, cwd,
                         registered_at, last_seen,
-                        consumer_protocol, process_start_identity,
-                        host_session_id, host_session_title
+                        consumer_protocol, delivery_mode,
+                        process_start_identity, host_session_id
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id, name, pane_id,
                         tmux_session, tmux_socket,
                         display_addr, agent_kind.value,
-                        pid, cwd, now, now,
-                        consumer_protocol.value, process_start_identity,
-                        host_session_id, host_session_title,
+                        pid, cwd, now, now, protocol_value, mode_value.value,
+                        process_start_identity, host_id_value,
                     ),
                 )
             conn.commit()
@@ -268,10 +276,10 @@ class MsgStore:
             cwd=cwd,
             registered_at=now,
             last_seen=now,
-            consumer_protocol=consumer_protocol,
+            consumer_protocol=protocol_value,
+            delivery_mode=mode_value,
             process_start_identity=process_start_identity,
-            host_session_id=host_session_id,
-            host_session_title=host_session_title,
+            host_session_id=host_id_value,
         )
 
     def get_agent_by_name(
@@ -382,10 +390,10 @@ class MsgStore:
         pid: int | None = None,
         cwd: str | None = None,
         process_start_identity: str | None = None,
-        replace_candidate_session_id: str | None = None,
+        replace_registration_id: str | None = None,
         _failpoint: Callable[[str], None] | None = None,
     ) -> Agent:
-        """Move one active identity, optionally replacing an exact candidate."""
+        """Move one active identity, optionally replacing one registration."""
         conn = self._get_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -415,11 +423,10 @@ class MsgStore:
                 AND session_id != ?""",
                 (pane_id, tmux_session, tmux_socket, tmux_socket, session_id),
             ).fetchall()
-            if replace_candidate_session_id is None:
+            if replace_registration_id is None:
                 if occupied:
                     raise ValueError("target pane already has an active msg registration")
                 next_host_session_id = current["host_session_id"]
-                next_host_session_title = current["host_session_title"]
             else:
                 requested_kind = agent_kind or AgentKind(current["agent_kind"])
                 expected_identity = (
@@ -432,9 +439,9 @@ class MsgStore:
                     cwd,
                 )
                 if not occupied:
-                    candidate = conn.execute(
+                    replacement = conn.execute(
                         "SELECT * FROM agents WHERE session_id = ? AND active = 0",
-                        (replace_candidate_session_id,),
+                        (replace_registration_id,),
                     ).fetchone()
                     current_identity = (
                         current["pane_id"],
@@ -445,110 +452,72 @@ class MsgStore:
                         current["process_start_identity"],
                         current["cwd"],
                     )
-                    candidate_identity = (
-                        candidate["pane_id"],
-                        candidate["tmux_session"],
-                        candidate["tmux_socket"],
-                        candidate["agent_kind"],
-                        candidate["pid"],
-                        candidate["process_start_identity"],
-                        candidate["cwd"],
-                    ) if candidate else None
+                    replacement_identity = (
+                        replacement["pane_id"],
+                        replacement["tmux_session"],
+                        replacement["tmux_socket"],
+                        replacement["agent_kind"],
+                        replacement["pid"],
+                        replacement["process_start_identity"],
+                        replacement["cwd"],
+                    ) if replacement else None
                     if (
                         current_identity == expected_identity
-                        and candidate_identity == expected_identity
+                        and replacement_identity == expected_identity
                     ):
                         conn.commit()
                         return self._row_to_agent(current)
                 if len(occupied) != 1:
-                    raise ValueError("replace candidate is not the sole target registration")
-                candidate = occupied[0]
-                if candidate["session_id"] != replace_candidate_session_id:
-                    raise ValueError("replace candidate is not the target registration")
-                candidate_identity = (
-                    candidate["pane_id"],
-                    candidate["tmux_session"],
-                    candidate["tmux_socket"],
-                    candidate["agent_kind"],
-                    candidate["pid"],
-                    candidate["process_start_identity"],
-                    candidate["cwd"],
-                )
-                if expected_identity != candidate_identity:
-                    raise ValueError("candidate identity mismatch")
-                next_host_session_id = candidate["host_session_id"]
-                first_mate_retarget = (
-                    current["consumer_protocol"]
-                    == ConsumerProtocol.FIRST_MATE_V1.value
-                )
-                if (
-                    first_mate_retarget
-                    and (
-                        not next_host_session_id
-                        or candidate["consumer_protocol"]
-                        != ConsumerProtocol.FIRST_MATE_V1.value
-                        or not candidate["host_session_title"]
-                        or candidate["host_session_title"] != candidate["name"]
-                        or not is_first_mate_session_title(candidate["name"])
-                        or not candidate["name"].startswith(
-                            f"{current['name']}-candidate-"
-                        )
-                    )
-                ):
                     raise ValueError(
-                        "candidate name/title/host session identity is invalid"
+                        "replacement is not the sole target registration"
                     )
-                if first_mate_retarget:
-                    reused = conn.execute(
-                        """SELECT 1 FROM agents
-                        WHERE active = 0 AND session_id != ?
-                        AND tmux_session = ?
-                        AND (tmux_socket IS ? OR tmux_socket = ?)
-                        AND name LIKE ? LIMIT 1""",
-                        (
-                            candidate["session_id"],
-                            candidate["tmux_session"],
-                            candidate["tmux_socket"],
-                            candidate["tmux_socket"],
-                            f"{candidate['name']}@retired:%",
-                        ),
-                    ).fetchone()
-                    if reused:
-                        raise ValueError("candidate generation was reused")
-                next_host_session_title = (
-                    current["name"]
-                    if current["consumer_protocol"]
-                    == ConsumerProtocol.FIRST_MATE_V1.value
-                    else candidate["host_session_title"]
+                replacement = occupied[0]
+                if replacement["session_id"] != replace_registration_id:
+                    raise ValueError("replacement is not the target registration")
+                replacement_identity = (
+                    replacement["pane_id"],
+                    replacement["tmux_session"],
+                    replacement["tmux_socket"],
+                    replacement["agent_kind"],
+                    replacement["pid"],
+                    replacement["process_start_identity"],
+                    replacement["cwd"],
                 )
+                if expected_identity != replacement_identity:
+                    raise ValueError("replacement identity mismatch")
+                next_host_session_id = replacement["host_session_id"]
                 conn.execute(
                     RELEASE_EXPIRED_SQL,
-                    (now, candidate["session_id"], candidate["session_id"]),
+                    (
+                        now,
+                        replacement["session_id"],
+                        replacement["session_id"],
+                    ),
                 )
                 unread = conn.execute(
                     """SELECT count(*) FROM deliveries
                     WHERE recipient_id = ? AND state NOT IN ('read', 'retired')""",
-                    (candidate["session_id"],),
+                    (replacement["session_id"],),
                 ).fetchone()[0]
                 if unread:
                     raise ValueError(
-                        f"candidate has {unread} unread delivery; drain it first"
+                        f"replacement has {unread} unread delivery; drain it first"
                     )
                 if _failpoint:
-                    _failpoint("before_candidate_deactivate")
+                    _failpoint("before_replacement_deactivate")
                 conn.execute(
                     "DELETE FROM continuation_leases WHERE agent_id = ?",
-                    (candidate["session_id"],),
+                    (replacement["session_id"],),
                 )
                 changed = conn.execute(
                     """UPDATE agents SET active = 0, display_addr = NULL,
                         last_seen = ? WHERE session_id = ? AND active = 1""",
-                    (now, candidate["session_id"]),
+                    (now, replacement["session_id"]),
                 ).rowcount
                 if changed != 1:
-                    raise ValueError("replace candidate changed concurrently")
+                    raise ValueError("replacement changed concurrently")
                 if _failpoint:
-                    _failpoint("after_candidate_deactivate")
+                    _failpoint("after_replacement_deactivate")
 
             next_kind = agent_kind or AgentKind(current["agent_kind"])
             next_pid = current["pid"] if pid is None else pid
@@ -561,12 +530,11 @@ class MsgStore:
             conn.execute(
                 """UPDATE agents SET pane_id = ?, display_addr = ?,
                     agent_kind = ?, pid = ?, cwd = ?, process_start_identity = ?,
-                    host_session_id = ?, host_session_title = ?, last_seen = ?
+                    host_session_id = ?, last_seen = ?
                 WHERE session_id = ? AND active = 1""",
                 (
                     pane_id, display_addr, next_kind.value, next_pid, next_cwd,
-                    next_start, next_host_session_id, next_host_session_title,
-                    _now_iso(), session_id,
+                    next_start, next_host_session_id, _now_iso(), session_id,
                 ),
             )
             if _failpoint:
@@ -624,19 +592,19 @@ class MsgStore:
     def _idle_continuation() -> ContinuationStatus:
         return ContinuationStatus(state=ContinuationState.IDLE)
 
-    def _require_first_mate_agent(
+    def _require_pull_agent(
         self, conn: sqlite3.Connection, caller: RegistrationIdentity,
     ) -> None:
         row = conn.execute(
-            """SELECT consumer_protocol, tmux_session, tmux_socket,
+            """SELECT delivery_mode, tmux_session, tmux_socket,
                 pane_id, pid, process_start_identity FROM agents
             WHERE session_id = ? AND active = 1""",
             (caller.session_id,),
         ).fetchone()
         if not row:
             raise ValueError("active registration not found")
-        if row["consumer_protocol"] != ConsumerProtocol.FIRST_MATE_V1.value:
-            raise ValueError("continuation requires first-mate.v1 registration")
+        if row["delivery_mode"] != DeliveryMode.PULL.value:
+            raise ValueError("continuation requires pull registration")
         if (
             caller.pid is None
             or not caller.process_start_identity
@@ -668,7 +636,7 @@ class MsgStore:
         conn = self._get_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            self._require_first_mate_agent(conn, caller)
+            self._require_pull_agent(conn, caller)
             conn.execute(
                 """INSERT INTO continuation_leases (
                     agent_id, generation, expires_at, updated_at
@@ -703,7 +671,7 @@ class MsgStore:
         conn = self._get_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            self._require_first_mate_agent(conn, caller)
+            self._require_pull_agent(conn, caller)
             row = conn.execute(
                 """SELECT generation FROM continuation_leases
                 WHERE agent_id = ?""",
@@ -741,7 +709,7 @@ class MsgStore:
         conn = self._get_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            self._require_first_mate_agent(conn, caller)
+            self._require_pull_agent(conn, caller)
             changed = conn.execute(
                 """DELETE FROM continuation_leases
                 WHERE agent_id = ? AND generation = ?""",
@@ -764,8 +732,8 @@ class MsgStore:
                 FROM continuation_leases c
                 JOIN agents a ON a.session_id = c.agent_id
                 WHERE c.agent_id = ? AND a.active = 1
-                    AND a.consumer_protocol = ?""",
-                (agent_id, ConsumerProtocol.FIRST_MATE_V1.value),
+                    AND a.delivery_mode = ?""",
+                (agent_id, DeliveryMode.PULL.value),
             ).fetchone()
         finally:
             conn.close()
@@ -1113,26 +1081,26 @@ class MsgStore:
         finally:
             conn.close()
 
-    def unknown_pending_consumer_protocols(self) -> list[tuple[str, int]]:
-        """Return corrupt protocol values that are blocking pending delivery."""
+    def unknown_pending_delivery_modes(self) -> list[tuple[str, int]]:
+        """Return corrupt delivery modes that are blocking pending delivery."""
         conn = self._get_conn()
         try:
             rows = conn.execute(
-                """SELECT a.consumer_protocol, count(*) AS delivery_count
+                """SELECT a.delivery_mode, count(*) AS delivery_count
                 FROM agents a
                 JOIN deliveries d ON d.recipient_id = a.session_id
                 WHERE a.active = 1
-                    AND a.consumer_protocol NOT IN (?, ?)
+                    AND a.delivery_mode NOT IN (?, ?)
                     AND d.state NOT IN ('read', 'retired')
-                GROUP BY a.consumer_protocol
-                ORDER BY a.consumer_protocol""",
+                GROUP BY a.delivery_mode
+                ORDER BY a.delivery_mode""",
                 (
-                    ConsumerProtocol.LEGACY.value,
-                    ConsumerProtocol.FIRST_MATE_V1.value,
+                    DeliveryMode.PUSH.value,
+                    DeliveryMode.PULL.value,
                 ),
             ).fetchall()
             return [
-                (row["consumer_protocol"], int(row["delivery_count"]))
+                (row["delivery_mode"], int(row["delivery_count"]))
                 for row in rows
             ]
         finally:
@@ -1327,7 +1295,7 @@ class MsgStore:
         claimer_id: str,
         claim_duration_secs: int = 60,
         recipient_id: str | None = None,
-        consumer_protocol: ConsumerProtocol = ConsumerProtocol.LEGACY,
+        delivery_mode: DeliveryMode = DeliveryMode.PUSH,
     ) -> list[dict]:
         """Claim pending deliveries for notification.
 
@@ -1352,13 +1320,13 @@ class MsgStore:
                     claim_expires_at = ?
                 WHERE recipient_id IN (
                     SELECT session_id FROM agents
-                    WHERE active = 1 AND consumer_protocol = ?
+                    WHERE active = 1 AND delivery_mode = ?
                 ) AND (? IS NULL OR recipient_id = ?) AND (
                     state = 'pending'
                     OR (state = 'claimed' AND claim_expires_at < ?)
                 )""",
                 (
-                    claimer_id, expires_iso, consumer_protocol.value,
+                    claimer_id, expires_iso, delivery_mode.value,
                     recipient_id, recipient_id, now,
                 ),
             )
@@ -1373,7 +1341,8 @@ class MsgStore:
                     r.pane_id as recipient_pane_id,
                     r.tmux_socket as recipient_tmux_socket,
                     r.agent_kind as recipient_agent_kind,
-                    r.consumer_protocol as recipient_consumer_protocol
+                    r.consumer_protocol as recipient_consumer_protocol,
+                    r.delivery_mode as recipient_delivery_mode
                 FROM deliveries d
                 JOIN messages m ON d.message_id = m.id
                 JOIN threads t ON m.thread_id = t.id
@@ -1382,9 +1351,9 @@ class MsgStore:
                 WHERE d.claimed_by = ?
                     AND d.state = 'claimed'
                     AND r.active = 1
-                    AND r.consumer_protocol = ?
+                    AND r.delivery_mode = ?
                 ORDER BY d.recipient_id, m.created_at""",
-                (claimer_id, consumer_protocol.value),
+                (claimer_id, delivery_mode.value),
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -1399,10 +1368,10 @@ class MsgStore:
                 JOIN agents a ON a.session_id = d.recipient_id
                 WHERE d.id = ? AND d.claimed_by = ?
                     AND d.state = 'claimed' AND d.claim_expires_at >= ?
-                    AND a.active = 1 AND a.consumer_protocol = ?""",
+                    AND a.active = 1 AND a.delivery_mode = ?""",
                 (
                     delivery_id, claimer_id, _now_iso(),
-                    ConsumerProtocol.LEGACY.value,
+                    DeliveryMode.PUSH.value,
                 ),
             ).fetchone() is not None
         finally:
@@ -1431,10 +1400,10 @@ class MsgStore:
                 WHERE d.id IN ({placeholders}) AND d.claimed_by = ?
                     AND d.state IN ('claimed', 'read')
                     AND d.claim_expires_at >= ?
-                    AND a.active = 1 AND a.consumer_protocol = ?""",
+                    AND a.active = 1 AND a.delivery_mode = ?""",
                 (
                     *delivery_ids, claimer_id, now,
-                    ConsumerProtocol.LEGACY.value,
+                    DeliveryMode.PUSH.value,
                 ),
             ).fetchone()[0]
             if current != len(delivery_ids):
@@ -1650,8 +1619,10 @@ class MsgStore:
             cwd=row["cwd"],
             registered_at=row["registered_at"],
             last_seen=row["last_seen"],
-            consumer_protocol=ConsumerProtocol(row["consumer_protocol"]),
+            consumer_protocol=validate_consumer_protocol(
+                row["consumer_protocol"],
+            ),
+            delivery_mode=DeliveryMode(row["delivery_mode"]),
             process_start_identity=row["process_start_identity"],
-            host_session_id=row["host_session_id"],
-            host_session_title=row["host_session_title"],
+            host_session_id=validate_host_session_id(row["host_session_id"]),
         )

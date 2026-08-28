@@ -5,10 +5,10 @@ allowed-tools: Bash
 
 You have been notified of new inter-agent messages.
 
-If this session was registered with `consumer_protocol=first-mate.v1`, do not
-run the legacy command below. Invoke `$first-mate`; its relative helper owns
-the bounded peek → journal fsync → explicit ack sequence. A msg delivery is
-read only after it is durable in that journal, not when business work ends.
+If this session was registered with `delivery_mode=pull`, do not run the
+legacy command below. Invoke the handler identified by its opaque protocol
+label; that handler owns bounded peek → durable journal → explicit ack. msg
+does not interpret the handler protocol or its business completion semantics.
 
 1. For a legacy registration, read your inbox:
 

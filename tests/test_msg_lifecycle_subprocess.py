@@ -114,7 +114,6 @@ def attest_pane(
         process_start_identity=start,
         cwd=target.cwd,
         host_session_id=f"host:{name}",
-        host_session_title=name,
         code_sha256=hook_module_sha256(),
     )
 
@@ -172,7 +171,7 @@ def disposable_tmux(tmp_path: Path, kinds: tuple[str, ...]):
     (
         ["register", "--json"],
         ["list", "--unknown", "--json"],
-        ["register", "agent", "--consumer-protocol", "future", "--json"],
+        ["register", "agent", "--consumer-protocol", "Future", "--json"],
     ),
 )
 def test_real_console_parse_errors_are_one_machine_object(tmp_path, tail):
@@ -251,7 +250,7 @@ def test_real_tmux_register_retarget_and_continuation_identity(
                     [
                         "--db", str(db_path), "register", logical_name,
                         "--pane", source_pane, "--consumer-protocol",
-                        "first-mate.v1", "--json",
+                        "first-mate.v1", "--delivery-mode", "pull", "--json",
                     ],
                     env=base_env,
                 )
@@ -264,7 +263,7 @@ def test_real_tmux_register_retarget_and_continuation_identity(
                     [
                         "--db", str(db_path), "register", candidate_name,
                         "--pane", target_pane, "--consumer-protocol",
-                        "first-mate.v1", "--json",
+                        "first-mate.v1", "--delivery-mode", "pull", "--json",
                     ],
                     env=base_env,
                 )
@@ -300,7 +299,7 @@ def test_real_tmux_register_retarget_and_continuation_identity(
             retarget_argv = [
                 "--db", str(db_path), "retarget", "--session-id",
                 source["session_id"], "--pane", target_pane,
-                "--replace-candidate", candidate["session_id"], "--json",
+                        "--replace-registration", candidate["session_id"], "--json",
             ]
             first = json_result(run_msg(retarget_argv, env=base_env))["data"]["agent"]
             retried = json_result(run_msg(retarget_argv, env=base_env))["data"]["agent"]
@@ -395,7 +394,7 @@ def test_real_tmux_peek_then_explicit_ack(tmp_path):
                     [
                         "--db", str(db_path), "register", sender_name,
                         "--pane", sender_pane, "--consumer-protocol",
-                        "first-mate.v1", "--json",
+                        "first-mate.v1", "--delivery-mode", "pull", "--json",
                     ],
                     env=base_env,
                 )
@@ -408,7 +407,7 @@ def test_real_tmux_peek_then_explicit_ack(tmp_path):
                     [
                         "--db", str(db_path), "register", recipient_name,
                         "--pane", recipient_pane, "--consumer-protocol",
-                        "first-mate.v1", "--json",
+                        "first-mate.v1", "--delivery-mode", "pull", "--json",
                     ],
                     env=base_env,
                 )
