@@ -1,16 +1,16 @@
 {
   "schema": "msg.plugin.release.v1",
   "cli_distribution": "claude-code-tools",
-  "cli_release_base": "1.25.6",
+  "cli_release_base": "1.25.7",
   "cli_release_status": "unreleased",
-  "cli_source_commit": "d36fb47a81fba034c33b32ebdf7d2168eb61dd4a",
-  "cli_wheel_sha256": "937a3adcee6b0156b7d69ebc6abbe8287f5b60219e74510d6c2814fe6a293e67",
+  "cli_source_commit": "f26e0b9ea87387f6331860a417a26f42212f7708",
+  "cli_wheel_sha256": "a7cac1daa7c9fa5517e909679b2d090264595592b18fd5366921c4557015861f",
   "cli_contract_schema": "msg.cli.v1",
-  "db_schema_version": 4,
-  "plugin_version": "1.15.1",
-  "plugin_payload_sha256": "caf6522c84d1fcc5b1dcdf3d94f7f866b8f2efd86673154a701abf881f139b20",
-  "hooks_manifest_sha256": "1e2745075b516fd08995b24ab4f1403383a69f0a93025181d12c303446ce0087",
+  "db_schema_version": 5,
+  "plugin_version": "1.15.2",
+  "plugin_payload_sha256": "f6a76613dd503f475e770daa8c69d09fb7fd7dc2b9f59bbcd851f53fc792002d",
+  "hooks_manifest_sha256": "be4d878e8886f1307715303e23b6d56347534b712f5b53b307e4ccc087fc8f70",
   "hook_adapter_sha256": "28d0eec330efcd10ebd6418b2cf8e2d6c20dbe95bae7119199fd00b5f5651bf4",
-  "claude_manifest_sha256": "907cea690801ed26841411dbc2163be4a68ffb7aa69f826de5b7506a3d3cfdc1",
-  "codex_manifest_sha256": "449d091eba8c1358d65dd434e387be891156758cfe537740fb9b6ac7f9b727b8"
+  "claude_manifest_sha256": "d7945b1dba445156f73a776c8d0a80effa090e4436949bc2f7f28c8c64c68430",
+  "codex_manifest_sha256": "eba780dc28beedba7356fbef8842975134f3a8dfff8eb3ffb0df5f8ccc5854b6"
 }
